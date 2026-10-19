@@ -164,6 +164,13 @@ fn run_action(app: &mut App, a: &str) {
                 "wordcount" => Some(Dialog::WordCount),
                 "about" => Some(Dialog::About),
                 "shortcuts" => Some(Dialog::Shortcuts),
+                "font" => Some(Dialog::font(app)),
+                "paragraph" => Some(Dialog::paragraph(app)),
+                "pagesetup" => Some(Dialog::page_setup(app)),
+                "find" => Some(Dialog::FindReplace { replace: true }),
+                "table" => Some(Dialog::InsertTable { rows: 3, cols: 4 }),
+                "symbol" => Some(Dialog::Symbol { recent: Vec::new() }),
+                "options" => Some(Dialog::Options { author: app.doc.settings.author.clone(), autocorrect: true, spelling: true }),
                 _ => None,
             }
         }

@@ -186,7 +186,8 @@ fn ok_cancel(ui: &mut Ui) -> (bool, bool) {
     let mut ok = false;
     let mut cancel = false;
     ui.add_space(6.0);
-    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+    let w = ui.available_width().max(160.0);
+    ui.allocate_ui_with_layout(egui::vec2(w, 24.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
         if ui.button("Cancel").clicked() {
             cancel = true;
         }
