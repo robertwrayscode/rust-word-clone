@@ -2,5 +2,6 @@
 
 pub mod model;
 pub mod styles;
+pub mod io;
 
 pub use model::*;
