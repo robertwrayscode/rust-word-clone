@@ -29,6 +29,8 @@ pub fn read(bytes: &[u8]) -> Document {
 
 pub fn read_str(text: &str) -> Document {
     let mut doc = Document::new();
+    // A final line terminator does not start another paragraph.
+    let text = text.strip_suffix("\r\n").or_else(|| text.strip_suffix('\n')).or_else(|| text.strip_suffix('\r')).unwrap_or(text);
     doc.body = text_to_blocks(text);
     doc
 }
