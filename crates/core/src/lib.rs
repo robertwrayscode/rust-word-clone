@@ -2,7 +2,6 @@
 
 pub mod edit;
 pub mod fonts;
-pub mod io;
 pub mod layout;
 pub mod model;
 pub mod pdf;
