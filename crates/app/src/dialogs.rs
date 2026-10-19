@@ -947,6 +947,8 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                 ui.label("Opens and saves .docx, .odt, .rtf, .html, .txt and .md; exports PDF.");
                 ui.add_space(4.0);
                 ui.label(RichText::new("Bundled fonts: Carlito, Caladea and Liberation (SIL Open Font License).").small().color(theme::MUTED));
+                ui.label(RichText::new("Spelling dictionary from SCOWL and Hunspell en_US / en_GB word lists (Kevin Atkinson and contributors, permissive licence).").small().color(theme::MUTED));
+                ui.label(RichText::new("Thesaurus derived from WordNet 3.0, Copyright 2006 Princeton University (WordNet licence).").small().color(theme::MUTED));
                 ui.add_space(6.0);
                 if ui.button("   OK   ").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                     keep = false;
