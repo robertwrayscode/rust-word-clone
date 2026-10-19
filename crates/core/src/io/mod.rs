@@ -134,9 +134,6 @@ pub fn open(path: &Path) -> Result<Document, String> {
         _ => sniffed,
     };
     let mut doc = read_bytes(&bytes, fmt)?;
-    if doc.properties.title.is_empty() && fmt != Format::Docx && fmt != Format::Odt {
-        // Leave the title alone; the app shows the file name.
-    }
     if doc.body.is_empty() {
         doc.body.push(crate::model::Block::Para(crate::model::Paragraph::new()));
     }

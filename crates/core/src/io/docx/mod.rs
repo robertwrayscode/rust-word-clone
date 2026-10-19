@@ -4,7 +4,7 @@ mod read;
 mod write;
 
 pub use read::read;
-pub(crate) use read::merge_runs;
+pub(crate) use read::{field_from_instr, merge_runs};
 pub use write::write;
 
 /// Built-in style ids and the names Word uses for them in styles.xml. Word recognises built-in styles by
