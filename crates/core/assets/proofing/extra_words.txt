@@ -1,0 +1,30 @@
+# Modern words added on top of SCOWL/Hunspell (one per line, exact case).
+# Curated for RWord; same licence as the rest of RWord (MIT).
+email emails emailed emailing e-mail e-mails online offline website websites webpage webpages
+smartphone smartphones WiFi Wi-Fi wifi iPhone iPhones iPad iPads iPod iPods iOS macOS Android
+Google Googled Googling googled googling Microsoft Excel PowerPoint Outlook OneDrive OneNote SharePoint
+Bluetooth app apps blog blogs blogger bloggers blogging blogged vlog vlogs vlogger vloggers vlogging
+podcast podcasts podcaster podcasters podcasting emoji emojis emoticon emoticons hashtag hashtags
+selfie selfies tweet tweets tweeted tweeting retweet retweets retweeted Twitter Facebook Instagram
+YouTube YouTuber YouTubers LinkedIn WhatsApp TikTok Snapchat Reddit Wikipedia eBay PayPal Netflix
+Spotify Skype GitHub Linux Ubuntu MacBook Chromebook Firefox JavaScript TypeScript
+login logins logout username usernames passcode passcodes signup touchscreen touchscreens
+laptop laptops smartwatch smartwatches wearable wearables downloadable
+livestream livestreams livestreamed livestreaming broadband ebook ebooks e-book e-books
+ecommerce e-commerce startup startups crowdfunding crowdfunded crowdsource crowdsourced crowdsourcing
+cryptocurrency cryptocurrencies bitcoin bitcoins Bitcoin blockchain blockchains fintech
+chatbot chatbots metadata dataset datasets cybersecurity cyberattack cyberattacks cybercrime
+malware ransomware spyware adware phishing antivirus inbox inboxes voicemail voicemails
+webcam webcams webinar webinars videoconference videoconferencing screenshot screenshots
+screencast screencasts multiplayer gameplay gamer gamers esports workflow workflows
+dashboard dashboards analytics toolbar toolbars sidebar sidebars dropdown dropdowns checkbox
+checkboxes popup popups tooltip tooltips plugin plugins add-on add-ons geotag geotagged
+geolocation hotspot hotspots homepage homepages intranet intranets newsfeed unfollow unfollowed
+unfriend unfriended texting microservice microservices middleware frontend backend devops DevOps
+refactor refactors refactoring refactored codebase codebases repo repos SaaS IoT
+COVID coronavirus coronaviruses lockdown lockdowns telehealth telemedicine self-care wellbeing
+well-being vegan vegans veganism gluten-free superfood superfoods kombucha quinoa Brexit
+Uber Airbnb carpool carpooling rideshare ridesharing staycation staycations glamping
+hackathon hackathons meme memes GIF GIFs JPEG JPEGs Kindle Xbox PlayStation Nintendo Gmail
+iCloud iTunes AirPods Alexa Siri ChatGPT Dropbox Photoshop onboarding offboarding upskill
+upskilling reskill reskilling stakeholder stakeholders smartphone's website's app's emailer

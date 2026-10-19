@@ -5,6 +5,7 @@ pub mod fonts;
 pub mod layout;
 pub mod model;
 pub mod pdf;
+pub mod proofing;
 pub mod styles;
 pub mod util;
 
