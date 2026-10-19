@@ -1,0 +1,9 @@
+[package]
+name = "wordcore"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Document model, layout engine and file formats for RWord"
+
+[dependencies]
+ttf-parser = "0.25"
