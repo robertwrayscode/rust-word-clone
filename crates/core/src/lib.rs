@@ -8,6 +8,7 @@ pub mod pdf;
 pub mod proofing;
 pub mod styles;
 pub mod util;
+pub mod io;
 
 pub use edit::{CellRef, FindOptions, ParaPath, Pos};
 pub use model::*;

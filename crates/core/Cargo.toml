@@ -8,3 +8,4 @@ description = "Document model, layout engine and file formats for RWord"
 [dependencies]
 ttf-parser = "0.25"
 miniz_oxide = "0.8"
+zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }

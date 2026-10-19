@@ -1042,7 +1042,7 @@ impl App {
             (Some((b, _)), None) if !plain => Some(b.clone()),
             _ => None,
         };
-        let blocks = blocks.or_else(|| if plain { None } else { crate::clipboard::get_html_blocks() });
+        let blocks = blocks.or_else(|| if plain { None } else { crate::clipboard::get_html_blocks(&mut self.doc) });
         if let Some(img) = (blocks.is_none() && sys_text.is_none()).then(crate::clipboard::get_image).flatten() {
             self.insert_image(img, "Paste");
             return;
@@ -1757,7 +1757,7 @@ impl App {
                 self.path = Some(path.clone());
                 self.layout_dirty = true;
                 crate::fileio::add_recent(&mut self.recent, &path);
-                self.status = format!("Opened {}", path.display());
+                self.status = format!("Opened {}", path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
             }
             Err(e) => {
                 self.dialog = Some(Dialog::Message { title: "Couldn't open file".into(), text: format!("RWord couldn't open {}.\n\n{}", path.display(), e) });
@@ -1808,7 +1808,7 @@ impl App {
                 self.modified = false;
                 self.path = Some(path.clone());
                 crate::fileio::add_recent(&mut self.recent, &path);
-                self.status = format!("Saved {}", path.display());
+                self.status = format!("Saved {}", path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
                 true
             }
             Err(e) => {

@@ -17,9 +17,9 @@ pub fn get_text() -> Option<String> {
 }
 
 /// Rich content from another application (HTML on the clipboard).
-pub fn get_html_blocks() -> Option<Vec<Block>> {
+pub fn get_html_blocks(doc: &mut Document) -> Option<Vec<Block>> {
     let html = arboard::Clipboard::new().ok()?.get().html().ok()?;
-    let blocks = wordcore::io::html::read_fragment(&html);
+    let blocks = wordcore::io::html::read_fragment_into(&html, doc);
     if blocks.is_empty() {
         None
     } else {
