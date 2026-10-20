@@ -455,9 +455,14 @@ fn read_drawings_alternate_content_and_vml() {
     // Both images share the same decoded data.
     assert!(std::sync::Arc::ptr_eq(&imgs[0].data, &imgs[1].data));
     assert!(p.text().contains("smartsdt✓"));
-    // Text box content follows the paragraph.
-    assert_eq!(doc.body[1].as_para().unwrap().text(), "In a text box");
-    assert_eq!(doc.body.len(), 2);
+    // The anchored picture floats; the VML one is inline.
+    assert!(imgs[0].float.is_some());
+    assert!(imgs[1].float.is_none());
+    // The text box (wps Choice preferred over the VML fallback) stays in its anchor paragraph.
+    let tbs: Vec<&TextBox> = p.runs.iter().filter_map(|r| if let Inline::TextBox(t) = &r.content { Some(t.as_ref()) } else { None }).collect();
+    assert_eq!(tbs.len(), 1);
+    assert_eq!(tbs[0].paragraphs[0].text(), "In a text box");
+    assert_eq!(doc.body.len(), 1);
 }
 
 #[test]
@@ -484,10 +489,18 @@ fn read_notes_comments_revisions_and_sections() {
     assert_eq!(find_run(&doc, "new").props.revision.as_ref().unwrap().kind, RevisionKind::Insert);
     assert_eq!(find_run(&doc, "new").props.comments, vec![0]);
     assert_eq!(find_run(&doc, "old").props.revision.as_ref().unwrap().kind, RevisionKind::Delete);
-    // Section 2 ("Three") starts continuous? No: section 2's type is absent → nextPage; section 3 is nextPage.
-    assert_eq!(doc.body[1].as_para().unwrap().props.page_break_before, Some(true));
-    assert_eq!(doc.body[3].as_para().unwrap().props.page_break_before, Some(true));
-    assert_eq!(doc.body[2].as_para().unwrap().props.page_break_before, None);
+    // Three sections: "One" ends a continuous one, "Three" a next-page one; no page breaks are invented.
+    assert!(doc.body.iter().filter_map(|b| b.as_para()).all(|p| p.props.page_break_before.is_none()));
+    let secs = doc.sections();
+    assert_eq!(secs.len(), 2);
+    assert_eq!(secs[0].page.start, SectionStart::Continuous);
+    assert_eq!(secs[1].page.start, SectionStart::NextPage);
+    assert!(doc.body[0].as_para().unwrap().section.is_some());
+    assert!(doc.body[2].as_para().unwrap().section.is_some());
+    assert_eq!(secs[1].page.width, 612.0);
+    // Section 1 has no header in Word; section 2 has its own.
+    assert!(doc.section_headers(0).header.is_empty());
+    assert_eq!(doc.section_headers(1).header[0].as_para().unwrap().text(), "Running head");
     // Final section's page setup, header inherited from the earlier section.
     assert_eq!(doc.page.orientation(), Orientation::Landscape);
     assert_eq!(doc.page.columns, 3);
@@ -561,4 +574,162 @@ fn docx_loads_in_libreoffice() {
     let b2 = find_para(&back, "Bullet two");
     assert!(matches!(b2.props.list, Some(Some(_))));
     assert_eq!(back.page.orientation(), Orientation::Landscape);
+}
+
+// ---------- sections, floating objects, text boxes ----------
+
+#[test]
+fn docx_roundtrip_sections_floats_textboxes() {
+    let doc = sections_doc();
+    let back = roundtrip(&doc);
+    check_sections_doc(&back, "docx");
+    // Section 2 links to section 1's headers.
+    assert!(back.sections()[1].headers.is_none());
+    // Stable on a second pass.
+    let again = roundtrip(&back);
+    check_sections_doc(&again, "docx twice");
+}
+
+#[test]
+fn docx_section_header_inheritance() {
+    // First section without own headers: Word shows nothing there, so it must not pick up the last
+    // section's header.
+    let mut doc = Document::from_text("a");
+    doc.body[0].as_para_mut().unwrap().section = Some(Box::new(Section { page: PageSetup::default(), headers: None }));
+    doc.body.push(Block::Para(Paragraph::with_text("b")));
+    doc.headers.header = vec![Block::Para(Paragraph::with_text("Last head"))];
+    let xml = docx_part(&docx::write(&doc).unwrap(), "word/document.xml");
+    // Section 1 references the effective (= last section's) header so Word shows the same thing.
+    let first_sect = &xml[xml.find("<w:sectPr>").unwrap()..xml.find("</w:sectPr>").unwrap()];
+    assert!(first_sect.contains("headerReference"), "{first_sect}");
+    let back = roundtrip(&doc);
+    assert_eq!(back.section_headers(0).header[0].as_para().unwrap().text(), "Last head");
+    assert_eq!(back.headers.header[0].as_para().unwrap().text(), "Last head");
+
+    // Partial own references: the missing kind is inherited from the previous section.
+    let body = r#"<w:p><w:pPr><w:sectPr><w:headerReference w:type="default" r:id="rH1"/><w:footerReference w:type="default" r:id="rF1"/></w:sectPr></w:pPr><w:r><w:t>One</w:t></w:r></w:p>
+<w:p><w:pPr><w:sectPr><w:headerReference w:type="default" r:id="rH2"/><w:type w:val="evenPage"/></w:sectPr></w:pPr><w:r><w:t>Two</w:t></w:r></w:p>
+<w:p><w:r><w:t>Three</w:t></w:r></w:p><w:sectPr><w:type w:val="oddPage"/></w:sectPr>"#;
+    let hdr = |t: &str| format!(r#"<?xml version="1.0"?><w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:p><w:r><w:t>{t}</w:t></w:r></w:p></w:hdr>"#);
+    let ftr = r#"<?xml version="1.0"?><w:ftr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:p><w:r><w:t>Foot one</w:t></w:r></w:p></w:ftr>"#;
+    let rels = r#"<Relationship Id="rH1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header1.xml"/><Relationship Id="rH2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header2.xml"/><Relationship Id="rF1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer" Target="footer1.xml"/>"#;
+    let (h1, h2) = (hdr("Head one"), hdr("Head two"));
+    let doc = docx::read(&minimal(body, &[("word/header1.xml", &h1), ("word/header2.xml", &h2), ("word/footer1.xml", ftr)], rels)).unwrap();
+    let t = |b: &[Block]| b.iter().filter_map(|b| b.as_para()).map(|p| p.text()).collect::<String>();
+    assert_eq!(t(&doc.section_headers(0).header), "Head one");
+    assert_eq!(t(&doc.section_headers(1).header), "Head two");
+    assert_eq!(t(&doc.section_headers(1).footer), "Foot one");
+    assert_eq!(t(&doc.headers.header), "Head two");
+    assert_eq!(t(&doc.headers.footer), "Foot one");
+    assert_eq!(doc.sections()[1].page.start, SectionStart::EvenPage);
+    assert_eq!(doc.page.start, SectionStart::OddPage);
+}
+
+fn docx_part(bytes: &[u8], name: &str) -> String {
+    let mut z = zip::ZipArchive::new(std::io::Cursor::new(bytes.to_vec())).unwrap();
+    let mut f = z.by_name(name).unwrap();
+    let mut s = String::new();
+    std::io::Read::read_to_string(&mut f, &mut s).unwrap();
+    s
+}
+
+#[test]
+fn read_anchor_positions_groups_and_vml_textboxes() {
+    let png = wordcore::io::util::base64_decode(PNG_1X1).unwrap();
+    let body = r##"<w:p><w:r><w:drawing><wp:anchor distT="0" distB="0" distL="114300" distR="114300" simplePos="0" relativeHeight="1" behindDoc="1" locked="0" layoutInCell="1" allowOverlap="1"><wp:simplePos x="0" y="0"/><wp:positionH relativeFrom="page"><wp:align>right</wp:align></wp:positionH><wp:positionV relativeFrom="line"><wp:posOffset>-127000</wp:posOffset></wp:positionV><wp:extent cx="635000" cy="635000"/><wp:wrapNone/><wp:docPr id="1" name="p"/><a:graphic><a:graphicData><pic:pic><pic:blipFill><a:blip r:embed="rIdImg"/></pic:blipFill></pic:pic></a:graphicData></a:graphic></wp:anchor></w:drawing></w:r>
+<w:r><w:drawing><wp:anchor simplePos="1" behindDoc="0"><wp:simplePos x="254000" y="508000"/><wp:positionH relativeFrom="column"><wp:posOffset>0</wp:posOffset></wp:positionH><wp:positionV relativeFrom="paragraph"><wp:posOffset>0</wp:posOffset></wp:positionV><wp:extent cx="1270000" cy="1270000"/><wp:wrapTopAndBottom/><wp:docPr id="2" name="g"/><a:graphic><a:graphicData><wpg:wgp><wpg:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="1270000" cy="1270000"/><a:chOff x="0" y="0"/><a:chExt cx="2540000" cy="2540000"/></a:xfrm></wpg:grpSpPr>
+<wps:wsp><wps:spPr><a:xfrm><a:off x="1270000" y="0"/><a:ext cx="1270000" cy="635000"/></a:xfrm><a:solidFill><a:schemeClr val="accent1"><a:lumMod val="20000"/><a:lumOff val="80000"/></a:schemeClr></a:solidFill><a:ln><a:noFill/></a:ln></wps:spPr><wps:txbx><w:txbxContent><w:p><w:r><w:t>Grouped box</w:t></w:r></w:p></w:txbxContent></wps:txbx><wps:bodyPr lIns="0"><a:spAutoFit/></wps:bodyPr></wps:wsp>
+<pic:pic><pic:nvPicPr><pic:cNvPr id="3" name="x" descr="grouped pic"/></pic:nvPicPr><pic:blipFill><a:blip r:embed="rIdImg"/></pic:blipFill><pic:spPr><a:xfrm><a:off x="0" y="1270000"/><a:ext cx="254000" cy="254000"/></a:xfrm></pic:spPr></pic:pic></wpg:wgp></a:graphicData></a:graphic></wp:anchor></w:drawing></w:r>
+<w:r><w:pict><v:shape id="t" style="position:absolute;margin-left:10pt;margin-top:20pt;width:100pt;height:50pt;z-index:5;mso-position-horizontal-relative:margin;mso-position-vertical-relative:page" fillcolor="#ff0000" strokecolor="blue" strokeweight="2pt"><v:textbox inset="3pt,3pt,3pt,3pt"><w:txbxContent><w:p><w:r><w:t>VML box</w:t></w:r></w:p></w:txbxContent></v:textbox><w10:wrap type="square"/></v:shape></w:pict></w:r></w:p>"##;
+    let rels = r#"<Relationship Id="rIdImg" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/pic.png"/>"#;
+    let body = body.replace("<w:body>", "");
+    let doc_xml = minimal(&body, &[], rels);
+    let mut src = zip::ZipArchive::new(std::io::Cursor::new(doc_xml)).unwrap();
+    let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    for i in 0..src.len() {
+        let mut f = src.by_index(i).unwrap();
+        let name = f.name().unwrap().to_string();
+        let mut s = String::new();
+        std::io::Read::read_to_string(&mut f, &mut s).unwrap();
+        let s = if name == "word/document.xml" { s.replace("<w:document ", r#"<w:document xmlns:wpg="http://schemas.microsoft.com/office/word/2010/wordprocessingGroup" xmlns:w10="urn:schemas-microsoft-com:office:word" "#) } else { s };
+        z.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+        z.write_all(s.as_bytes()).unwrap();
+    }
+    z.start_file("word/media/pic.png", zip::write::SimpleFileOptions::default()).unwrap();
+    z.write_all(&png).unwrap();
+    let doc = docx::read(&z.finish().unwrap().into_inner()).unwrap();
+    let p = doc.body[0].as_para().unwrap();
+    let items: Vec<&Inline> = p.runs.iter().map(|r| &r.content).collect();
+    assert_eq!(items.len(), 4, "{items:?}");
+    let Inline::Image(i0) = items[0] else { panic!() };
+    let f0 = i0.float.unwrap();
+    assert_eq!((f0.wrap, f0.h_rel, f0.v_rel, f0.h_align), (WrapMode::Behind, HRel::Page, VRel::Line, Some(FloatAlign::End)));
+    assert_eq!(f0.y, -10.0);
+    assert_eq!(f0.dist, 9.0);
+    // Group: simplePos places it at (20, 40) on the page; children are scaled by 0.5.
+    let Inline::TextBox(tb) = items[1] else { panic!("{:?}", items[1]) };
+    let f1 = tb.float.unwrap();
+    assert_eq!((f1.wrap, f1.h_rel, f1.v_rel), (WrapMode::TopBottom, HRel::Page, VRel::Page));
+    assert_eq!((f1.x, f1.y), (70.0, 40.0));
+    assert_eq!((tb.width, tb.height), (50.0, 25.0));
+    assert_eq!(tb.paragraphs[0].text(), "Grouped box");
+    assert_eq!(tb.fill, Some(Color::rgb(0xDA, 0xE3, 0xF3)));
+    assert_eq!(tb.border, None);
+    assert_eq!(tb.padding, 0.0);
+    assert!(tb.auto_height);
+    let Inline::Image(i2) = items[2] else { panic!() };
+    assert_eq!(i2.alt, "grouped pic");
+    assert_eq!((i2.float.unwrap().x, i2.float.unwrap().y, i2.width), (20.0, 90.0, 10.0));
+    let Inline::TextBox(v) = items[3] else { panic!() };
+    let fv = v.float.unwrap();
+    assert_eq!((fv.wrap, fv.h_rel, fv.v_rel, fv.x, fv.y), (WrapMode::Square, HRel::Margin, VRel::Page, 10.0, 20.0));
+    assert_eq!((v.width, v.height, v.padding), (100.0, 50.0, 3.0));
+    assert_eq!(v.fill, Some(Color::rgb(255, 0, 0)));
+    assert_eq!(v.border.unwrap().width, 2.0);
+    assert_eq!(v.paragraphs[0].text(), "VML box");
+}
+
+/// LibreOffice must render our sections (page sizes), text box text and floating pictures, and our reader
+/// must understand LibreOffice's own DOCX output of the same document.
+#[test]
+fn docx_sections_render_in_libreoffice() {
+    if !soffice_available() {
+        eprintln!("soffice not available; skipping");
+        return;
+    }
+    let dir = scratch_dir().join("docx_sections_lo");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("sections.docx");
+    std::fs::write(&path, docx::write(&sections_doc()).unwrap()).unwrap();
+    let pdf = soffice_convert(&path, "pdf", &dir.join("pdf")).expect("LibreOffice could not convert the docx");
+    pdf_to_png(&pdf, &dir.join("page"));
+    let sizes = pdf_page_sizes(&pdf);
+    assert!(sizes.len() >= 3, "{sizes:?}");
+    assert!((sizes[0].0 - 612.0).abs() < 1.0 && (sizes[0].1 - 792.0).abs() < 1.0, "{sizes:?}");
+    assert!(sizes[1].0 > sizes[1].1, "section 2 should be landscape: {sizes:?}");
+    assert!((sizes[1].0 - 841.9).abs() < 1.5, "{sizes:?}");
+    if let Some(text) = pdf_text(&pdf) {
+        // (LibreOffice keeps the page style across a continuous section break, so "Header S3" is not shown.)
+        for needle in ["Box line one", "Box line two", "Header S1", "Footer S1", "Section two text", "Filler line 59"] {
+            assert!(text.contains(needle), "PDF lacks {needle:?}");
+        }
+    }
+    let lo_docx = soffice_convert(&path, "docx:MS Word 2007 XML", &dir.join("resaved")).expect("re-save");
+    let back = io::open(&lo_docx).unwrap();
+    assert_eq!(back.sections().len(), 2);
+    assert!((back.sections()[1].page.width - 841.9).abs() < 1.0);
+    let tb = body_paras(&back).iter().flat_map(|p| p.runs.iter()).find_map(|r| if let Inline::TextBox(t) = &r.content { Some(t.as_ref().clone()) } else { None }).expect("text box from LibreOffice");
+    assert_eq!(tb.paragraphs.iter().map(|p| p.text()).collect::<Vec<_>>(), vec!["Box line one", "Box line two"]);
+    assert_eq!(tb.fill, Some(Color::rgb(0xFF, 0xF2, 0xCC)));
+    let imgs: Vec<Image> = body_paras(&back).iter().flat_map(|p| p.runs.iter()).filter_map(|r| if let Inline::Image(i) = &r.content { Some(i.clone()) } else { None }).collect();
+    assert_eq!(imgs.len(), 2);
+    let f = imgs[0].float.expect("floating picture from LibreOffice");
+    assert_eq!(f.wrap, WrapMode::Square);
+    assert!((f.x - 36.0).abs() < 1.0 && (f.y - 18.0).abs() < 1.0, "{f:?}");
+    assert_eq!(imgs[1].float.map(|f| f.wrap), Some(WrapMode::Behind));
+    let t = |b: &[Block]| b.iter().filter_map(|b| b.as_para()).map(|p| p.text()).collect::<String>();
+    assert_eq!(t(&back.section_headers(0).header), "Header S1");
+    assert_eq!(t(&back.section_headers(1).header), "Header S1");
+    // LibreOffice drops the continuous last section's own header, so it is not checked here.
 }
