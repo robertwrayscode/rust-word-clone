@@ -75,6 +75,7 @@ pub enum Dialog {
     About,
     Zoom { pct: f32 },
     Shortcuts,
+    TextBox { pos: wordcore::Pos, text: String, fill: Option<wordcore::Color>, border: bool, width: f32, height: f32 },
 }
 
 impl Dialog {
@@ -131,7 +132,7 @@ impl Dialog {
     }
 
     pub fn page_setup(app: &App) -> Dialog {
-        Dialog::PageSetup(Box::new(PageForm { setup: app.doc.page.clone(), unit_inches: true }))
+        Dialog::PageSetup(Box::new(PageForm { setup: app.page_setup(), unit_inches: true }))
     }
 
     pub fn find_replace(app: &mut App, replace: bool) -> Dialog {
@@ -799,7 +800,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                 });
                 let (ok, cancel) = ok_cancel(ui);
                 if ok {
-                    let mut s = app.doc.page.clone();
+                    let mut s = app.page_setup();
                     s.columns = *n;
                     s.column_gap = *gap;
                     app.set_page_setup(s);
@@ -830,7 +831,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                     })
                     .inner;
                 if ok || remove {
-                    let mut s = app.doc.page.clone();
+                    let mut s = app.page_setup();
                     s.watermark = if remove || text.trim().is_empty() { None } else { Some(text.trim().to_string()) };
                     app.set_page_setup(s);
                 }
@@ -934,6 +935,46 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                 if ok {
                     app.doc.properties = (**p).clone();
                     app.modified = true;
+                }
+                if ok || cancel {
+                    keep = false;
+                }
+            });
+        }
+        Dialog::TextBox { pos, text, fill, border, width, height } => {
+            window("Text Box").show(ctx, |ui| {
+                ui.label("Text:");
+                ui.add(TextEdit::multiline(text).desired_width(320.0).desired_rows(5));
+                ui.add_space(4.0);
+                Grid::new("tb").num_columns(2).show(ui, |ui| {
+                    ui.label("Width:");
+                    ui.add(DragValue::new(width).range(18.0..=1000.0).speed(1.0).suffix(" pt"));
+                    ui.end_row();
+                    ui.label("Height:");
+                    ui.add(DragValue::new(height).range(18.0..=1000.0).speed(1.0).suffix(" pt"));
+                    ui.end_row();
+                    ui.label("Fill:");
+                    ui.horizontal(|ui| {
+                        let mut has = fill.is_some();
+                        if ui.checkbox(&mut has, "").changed() {
+                            *fill = if has { Some(wordcore::Color::WHITE) } else { None };
+                        }
+                        if let Some(c) = fill {
+                            let mut c32 = theme::c32(*c);
+                            if ui.color_edit_button_srgba(&mut c32).changed() {
+                                *c = theme::from_c32(c32);
+                            }
+                        }
+                    });
+                    ui.end_row();
+                    ui.label("Outline:");
+                    ui.checkbox(border, "");
+                    ui.end_row();
+                });
+                let (ok, cancel) = ok_cancel(ui);
+                if ok {
+                    let (p, t, f, b, w, h) = (*pos, text.clone(), *fill, *border, *width, *height);
+                    app.apply_text_box(p, &t, f, b, w, h);
                 }
                 if ok || cancel {
                     keep = false;

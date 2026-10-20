@@ -7,8 +7,8 @@
   <key>CFBundleIdentifier</key><string>com.robertwrayscode.rword</string>
   <key>CFBundleExecutable</key><string>rword</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.1.0</string>
-  <key>CFBundleVersion</key><string>1</string>
+  <key>CFBundleShortVersionString</key><string>0.2.0</string>
+  <key>CFBundleVersion</key><string>2</string>
   <key>LSMinimumSystemVersion</key><string>11.0</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>CFBundleDocumentTypes</key>
@@ -17,6 +17,8 @@
       <key>CFBundleTypeName</key><string>Word Document</string>
       <key>CFBundleTypeRole</key><string>Editor</string>
       <key>LSHandlerRank</key><string>Alternate</string>
+      <key>CFBundleTypeExtensions</key>
+      <array><string>docx</string><string>odt</string><string>rtf</string><string>txt</string><string>md</string><string>html</string><string>htm</string></array>
       <key>LSItemContentTypes</key>
       <array>
         <string>org.openxmlformats.wordprocessingml.document</string>
@@ -24,6 +26,7 @@
         <string>public.rtf</string>
         <string>public.plain-text</string>
         <string>public.html</string>
+        <string>net.daringfireball.markdown</string>
       </array>
     </dict>
   </array>

@@ -36,6 +36,11 @@ impl eframe::App for App {
             }
         }
 
+        // Documents opened from Finder (macOS).
+        for p in crate::macos_open::take() {
+            self.request(Pending::Open(Some(p)));
+        }
+
         // Window close.
         if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close {
             if self.modified {
@@ -309,7 +314,7 @@ fn ruler(app: &mut App, ui: &mut Ui) {
     p.rect_filled(rect, 0.0, theme::PANEL_BG);
     p.hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, theme::BORDER));
     let k = crate::canvas::scale(app);
-    let ps = &app.doc.page;
+    let ps = &app.page_setup();
     let x0 = app.canvas_origin_x;
     let band = Rect::from_min_max(pos2(x0, rect.top() + 4.0), pos2(x0 + ps.width * k, rect.bottom() - 4.0));
     p.rect_filled(band, 0.0, Color32::from_gray(205));

@@ -9,6 +9,8 @@ mod dialogs;
 mod fileio;
 mod fonts;
 mod images;
+mod macos_open;
+mod objects;
 mod panels;
 mod png;
 mod proof;
@@ -54,6 +56,7 @@ fn parse_args() -> Args {
 
 fn main() -> eframe::Result {
     let args = parse_args();
+    macos_open::install();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Document1 - RWord")
@@ -66,6 +69,7 @@ fn main() -> eframe::Result {
         "RWord",
         options,
         Box::new(move |cc| {
+            macos_open::set_context(&cc.egui_ctx);
             let db = wordcore::fonts::FontDb::global();
             fonts::install(&cc.egui_ctx, db);
             theme::apply(&cc.egui_ctx);

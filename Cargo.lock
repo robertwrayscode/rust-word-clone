@@ -57,13 +57,14 @@ checksum = "fc7eb209b1518d6bb87b283c20095f5228ecda460da70b44f0802523dea6da04"
 
 [[package]]
 name = "app"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arboard",
  "dirs",
  "eframe",
  "egui",
  "image",
+ "objc2 0.6.5",
  "rfd",
  "wordcore",
 ]
@@ -3223,7 +3224,7 @@ dependencies = [
 
 [[package]]
 name = "wordcore"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "miniz_oxide 0.8.9",
  "ttf-parser",

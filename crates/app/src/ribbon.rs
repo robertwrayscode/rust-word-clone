@@ -314,6 +314,28 @@ fn color_split(ui: &mut Ui, label: RichText, current: Color, tip: &str, picker: 
     (apply, pick)
 }
 
+/// "Wrap Text" choices for the selected picture or text box.
+pub fn wrap_menu(app: &mut App, ui: &mut Ui) {
+    let cur = match app.selected_object() {
+        Some((_, Inline::Image(i))) => i.float.map(|f| f.wrap),
+        Some((_, Inline::TextBox(t))) => t.float.map(|f| f.wrap),
+        _ => return,
+    };
+    for (n, w) in [
+        ("In Line with Text", None),
+        ("Square", Some(WrapMode::Square)),
+        ("Tight", Some(WrapMode::Tight)),
+        ("Top and Bottom", Some(WrapMode::TopBottom)),
+        ("Behind Text", Some(WrapMode::Behind)),
+        ("In Front of Text", Some(WrapMode::InFront)),
+    ] {
+        if ui.selectable_label(cur == w, n).clicked() {
+            app.set_wrap(w);
+            ui.close();
+        }
+    }
+}
+
 pub fn apply_format_painter(app: &mut App) {
     if let Some((chars, para, sticky)) = app.format_painter.clone() {
         app.checkpoint("Format Painter", crate::app::EditKind::Other);
@@ -781,10 +803,10 @@ fn insert(app: &mut App, ui: &mut Ui) {
     });
     group(ui, "Header & Footer", |ui| {
         if big(ui, "▔", "Header", "Edit the header").clicked() {
-            app.edit_header(false, false);
+            app.edit_header(false, None);
         }
         if big(ui, "▁", "Footer", "Edit the footer").clicked() {
-            app.edit_header(true, false);
+            app.edit_header(true, None);
         }
         big_menu(ui, "#", "Page Number", "Insert page numbers", |ui| {
             for (label, footer, al, total) in [
@@ -807,6 +829,9 @@ fn insert(app: &mut App, ui: &mut Ui) {
         });
     });
     group(ui, "Text", |ui| {
+        if big(ui, "🗐", "Text Box", "Insert a text box you can place anywhere on the page").clicked() {
+            app.insert_text_box();
+        }
         ui.vertical(|ui| {
             if small(ui, "📅 Date & Time", "Insert the current date or time").clicked() {
                 app.dialog = Some(Dialog::DateTime { selected: 1, update: false });
@@ -871,7 +896,7 @@ fn design(app: &mut App, ui: &mut Ui) {
         big_menu(ui, "💧", "Watermark", "Add a watermark behind the text", |ui| {
             for t in ["CONFIDENTIAL", "DRAFT", "DO NOT COPY", "SAMPLE", "URGENT"] {
                 if ui.button(t).clicked() {
-                    let mut s = app.doc.page.clone();
+                    let mut s = app.page_setup();
                     s.watermark = Some(t.into());
                     app.set_page_setup(s);
                     ui.close();
@@ -879,11 +904,11 @@ fn design(app: &mut App, ui: &mut Ui) {
             }
             ui.separator();
             if ui.button("Custom Watermark...").clicked() {
-                app.dialog = Some(Dialog::Watermark { text: app.doc.page.watermark.clone().unwrap_or_else(|| "DRAFT".into()) });
+                app.dialog = Some(Dialog::Watermark { text: app.page_setup().watermark.clone().unwrap_or_else(|| "DRAFT".into()) });
                 ui.close();
             }
             if ui.button("Remove Watermark").clicked() {
-                let mut s = app.doc.page.clone();
+                let mut s = app.page_setup();
                 s.watermark = None;
                 app.set_page_setup(s);
                 ui.close();
@@ -891,7 +916,7 @@ fn design(app: &mut App, ui: &mut Ui) {
         });
         big_menu(ui, "🎨", "Page Color", "Change the page colour", |ui| {
             if let Some(c) = palette(ui, Some("No Color")) {
-                let mut s = app.doc.page.clone();
+                let mut s = app.page_setup();
                 s.page_color = c;
                 app.set_page_setup(s);
                 ui.close();
@@ -906,7 +931,7 @@ fn design(app: &mut App, ui: &mut Ui) {
                 ("None", None),
             ] {
                 if ui.button(n).clicked() {
-                    let mut s = app.doc.page.clone();
+                    let mut s = app.page_setup();
                     s.page_borders = b.map(|b| Borders { top: Some(b), bottom: Some(b), left: Some(b), right: Some(b), ..Default::default() });
                     app.set_page_setup(s);
                     ui.close();
@@ -931,7 +956,7 @@ fn layout_tab(app: &mut App, ui: &mut Ui) {
                 ("Mirrored-like  (1\" / 1.25\")", 72.0, 72.0, 90.0, 72.0),
             ] {
                 if ui.button(n).clicked() {
-                    let mut s = app.doc.page.clone();
+                    let mut s = app.page_setup();
                     s.margin_top = t;
                     s.margin_bottom = b;
                     s.margin_left = l;
@@ -947,15 +972,15 @@ fn layout_tab(app: &mut App, ui: &mut Ui) {
             }
         });
         big_menu(ui, "⟲", "Orientation", "Portrait or landscape", |ui| {
-            let land = app.doc.page.width > app.doc.page.height;
+            let land = { let ps = app.page_setup(); ps.width > ps.height };
             if ui.selectable_label(!land, "Portrait").clicked() && land {
-                let mut s = app.doc.page.clone();
+                let mut s = app.page_setup();
                 std::mem::swap(&mut s.width, &mut s.height);
                 app.set_page_setup(s);
                 ui.close();
             }
             if ui.selectable_label(land, "Landscape").clicked() && !land {
-                let mut s = app.doc.page.clone();
+                let mut s = app.page_setup();
                 std::mem::swap(&mut s.width, &mut s.height);
                 app.set_page_setup(s);
                 ui.close();
@@ -965,7 +990,7 @@ fn layout_tab(app: &mut App, ui: &mut Ui) {
             for (n, w, h) in PAPER_SIZES {
                 let label = format!("{}  ({:.2}\" × {:.2}\")", n, w / 72.0, h / 72.0);
                 if ui.button(label).clicked() {
-                    let mut s = app.doc.page.clone();
+                    let mut s = app.page_setup();
                     let land = s.width > s.height;
                     s.width = if land { *h } else { *w };
                     s.height = if land { *w } else { *h };
@@ -981,8 +1006,8 @@ fn layout_tab(app: &mut App, ui: &mut Ui) {
         });
         big_menu(ui, "▥", "Columns", "Split text into columns", |ui| {
             for n in 1..=3u32 {
-                if ui.selectable_label(app.doc.page.columns == n, ["One", "Two", "Three"][n as usize - 1]).clicked() {
-                    let mut s = app.doc.page.clone();
+                if ui.selectable_label(app.page_setup().columns == n, ["One", "Two", "Three"][n as usize - 1]).clicked() {
+                    let mut s = app.page_setup();
                     s.columns = n;
                     app.set_page_setup(s);
                     ui.close();
@@ -990,7 +1015,7 @@ fn layout_tab(app: &mut App, ui: &mut Ui) {
             }
             ui.separator();
             if ui.button("More Columns...").clicked() {
-                app.dialog = Some(Dialog::Columns { n: app.doc.page.columns, gap: app.doc.page.column_gap });
+                app.dialog = Some(Dialog::Columns { n: app.page_setup().columns, gap: app.page_setup().column_gap });
                 ui.close();
             }
         });
@@ -1007,6 +1032,25 @@ fn layout_tab(app: &mut App, ui: &mut Ui) {
                 app.insert_inline(Inline::LineBreak, "Line Break");
                 ui.close();
             }
+            ui.separator();
+            ui.label(RichText::new("Section Breaks").strong());
+            for (n, k) in [
+                ("Next Page", SectionStart::NextPage),
+                ("Continuous", SectionStart::Continuous),
+                ("Even Page", SectionStart::EvenPage),
+                ("Odd Page", SectionStart::OddPage),
+            ] {
+                if ui.button(n).clicked() {
+                    app.insert_section_break(k);
+                    ui.close();
+                }
+            }
+        });
+    });
+    group(ui, "Arrange", |ui| {
+        let has = app.selected_object().is_some();
+        ui.add_enabled_ui(has, |ui| {
+            big_menu(ui, "▭", "Wrap Text", "Choose how text wraps around the selected picture or text box", |ui| wrap_menu(app, ui));
         });
     });
     let pp = app.current_para();

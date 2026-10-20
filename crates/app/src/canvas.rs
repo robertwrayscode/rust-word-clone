@@ -38,6 +38,14 @@ impl Geometry {
         let r = self.page_rect(app, page);
         pos2(r.left() + x * self.k, r.top() + y * self.k)
     }
+    /// Screen point → (x, y) in the coordinates of a given page.
+    fn to_doc_on_page(&self, app: &App, page: usize, p: Pos2) -> Option<(usize, f32, f32)> {
+        if page >= app.layout.pages.len() {
+            return None;
+        }
+        let r = self.page_rect(app, page);
+        Some((page, (p.x - r.left()) / self.k, (p.y - r.top()) / self.k))
+    }
     /// Screen point → (page, x, y) in document points.
     fn to_doc(&self, app: &App, p: Pos2) -> Option<(usize, f32, f32)> {
         if app.layout.pages.is_empty() {
@@ -176,7 +184,7 @@ fn paint(app: &mut App, ui: &mut Ui, geo: &Geometry, full: Rect) {
         // dim body while editing header/footer and vice versa
         let editing_hf = story != Story::Body;
         // corner marks of the text area (Word's crop marks)
-        let ps = &app.doc.page;
+        let ps = app.doc.section_page(page.section);
         let mk = Stroke::new(1.0, Color32::from_gray(190));
         for (cx, cy, dx, dy) in [
             (ps.margin_left, page.body_top, -1.0, -1.0),
@@ -239,7 +247,7 @@ fn paint(app: &mut App, ui: &mut Ui, geo: &Geometry, full: Rect) {
                 pclip.rect_filled(pr, 2.0, theme::ACCENT);
                 pclip.galley(pr.min + vec2(4.0, 1.0), g, Color32::WHITE);
             };
-            let first = i == 0 && app.doc.page.title_page;
+            let first = matches!(page.header_story, Some(Story::FirstHeader) | Some(Story::SectionPart(_, wordcore::HfKind::FirstHeader)));
             tag(hy, if first { "First Page Header" } else { "Header" });
             tag(fy, if first { "First Page Footer" } else { "Footer" });
             // dim body
@@ -250,6 +258,26 @@ fn paint(app: &mut App, ui: &mut Ui, geo: &Geometry, full: Rect) {
             let bot_r = Rect::from_min_max(to(0.0, page.body_bottom + 2.0), to(page.width, page.height));
             pclip.rect_filled(top_r, 0.0, Color32::from_white_alpha(100));
             pclip.rect_filled(bot_r, 0.0, Color32::from_white_alpha(100));
+        }
+        // Selected / dragged floating object.
+        let sel_obj = app.selected_object().map(|(p, _)| p);
+        for f in &page.floats {
+            let selected = sel_obj.map(|p| p.path == f.path && p.offset == f.offset).unwrap_or(false);
+            if selected {
+                let rr = Rect::from_min_size(to(f.x, f.y), vec2(f.w * k, f.h * k));
+                pclip.rect_stroke(rr, 0.0, Stroke::new(1.0, theme::ACCENT), egui::StrokeKind::Outside);
+                for c in [rr.left_top(), rr.right_top(), rr.left_bottom(), rr.right_bottom()] {
+                    pclip.rect_filled(Rect::from_center_size(c, vec2(7.0, 7.0)), 1.0, Color32::WHITE);
+                    pclip.rect_stroke(Rect::from_center_size(c, vec2(7.0, 7.0)), 1.0, Stroke::new(1.0, theme::ACCENT), egui::StrokeKind::Inside);
+                }
+            }
+        }
+        if let Some(d) = app.float_drag {
+            if d.page == i {
+                let rr = Rect::from_min_size(to(d.x, d.y), vec2(d.w * k, d.h * k));
+                pclip.rect_stroke(rr, 0.0, Stroke::new(1.5, theme::ACCENT), egui::StrokeKind::Outside);
+                pclip.rect_filled(rr, 0.0, Color32::from_rgba_unmultiplied(0x2B, 0x57, 0x9A, 30));
+            }
         }
         // Spelling squiggles.
         for (pg, x0, x1, y) in &spell {
@@ -372,6 +400,9 @@ fn handle_pointer(app: &mut App, ui: &mut Ui, resp: &egui::Response, geo: &Geome
         app.canvas_focused = true;
     }
     let Some(pointer) = resp.interact_pointer_pos() else { return };
+    if float_pointer(app, ui, resp, geo, pointer) {
+        return;
+    }
     let Some((page, pos, in_hf)) = hit(app, geo, pointer) else { return };
     if resp.secondary_clicked() {
         // Keep the selection if clicking inside it.
@@ -384,7 +415,7 @@ fn handle_pointer(app: &mut App, ui: &mut Ui, resp: &egui::Response, geo: &Geome
     // Header/footer switching.
     if resp.double_clicked() && in_hf && app.story() == Story::Body {
         let footer = geo.to_doc(app, pointer).map(|(_, _, y)| y > app.layout.pages[page].body_bottom).unwrap_or(false);
-        app.edit_header(footer, page == 0);
+        app.edit_header(footer, Some(page));
         return;
     }
     if (resp.clicked() || resp.double_clicked()) && !in_hf && app.story() != Story::Body {
@@ -448,6 +479,88 @@ fn handle_pointer(app: &mut App, ui: &mut Ui, resp: &egui::Response, geo: &Geome
     if resp.drag_stopped() && app.format_painter.is_some() && !app.sel.is_empty() {
         crate::ribbon::apply_format_painter(app);
     }
+}
+
+/// Floating object under a screen point: (page, box). Objects behind the text are only
+/// picked where there is no text.
+fn float_hit(app: &App, geo: &Geometry, p: Pos2) -> Option<(usize, wordcore::layout::FloatBox)> {
+    let (page, x, y) = geo.to_doc(app, p)?;
+    let pg = app.layout.pages.get(page)?;
+    let over_text = pg.lines.iter().any(|l| y >= l.top && y <= l.top + l.height && x >= l.left && x <= l.right);
+    pg.floats
+        .iter()
+        .rev()
+        .filter(|f| x >= f.x && x <= f.x + f.w && y >= f.y && y <= f.y + f.h)
+        .find(|f| f.wrap != wordcore::WrapMode::Behind || !over_text)
+        .map(|f| (page, f.clone()))
+}
+
+/// Mouse handling for floating pictures and text boxes. Returns true when handled.
+fn float_pointer(app: &mut App, ui: &mut Ui, resp: &egui::Response, geo: &Geometry, pointer: Pos2) -> bool {
+    if let Some(mut d) = app.float_drag {
+        if let Some((_, x, y)) = geo.to_doc_on_page(app, d.page, pointer) {
+            if d.resize {
+                let ratio = if d.h > 0.0 { d.w / d.h } else { 1.0 };
+                let mut w = (x - d.x).max(12.0);
+                let mut h = (y - d.y).max(12.0);
+                if !ui.input(|i| i.modifiers.shift) {
+                    // Keep proportions unless Shift is held.
+                    if w / ratio > h {
+                        h = w / ratio;
+                    } else {
+                        w = h * ratio;
+                    }
+                }
+                d.w = w;
+                d.h = h;
+            } else {
+                d.x = x - d.grab.0;
+                d.y = y - d.grab.1;
+            }
+            app.float_drag = Some(d);
+        }
+        if resp.drag_stopped() || !resp.dragged() {
+            app.float_drag = None;
+            if d.resize {
+                app.resize_object(d.pos, d.w, d.h);
+            } else {
+                app.move_object(d.pos, d.x, d.y);
+            }
+        }
+        return true;
+    }
+    if app.story() != Story::Body {
+        return false;
+    }
+    let pressed = resp.clicked() || resp.drag_started() || resp.double_clicked() || resp.secondary_clicked();
+    if !pressed {
+        return false;
+    }
+    // Resize handle of the selected floating object.
+    if resp.drag_started() {
+        if let Some((pos, _)) = app.selected_object() {
+            if let Some((page, x, y)) = geo.to_doc(app, pointer) {
+                if let Some(f) = app.layout.pages.get(page).and_then(|pg| pg.floats.iter().find(|f| f.path == pos.path && f.offset == pos.offset)) {
+                    let tol = 8.0 / geo.k;
+                    if (x - (f.x + f.w)).abs() < tol && (y - (f.y + f.h)).abs() < tol {
+                        app.float_drag = Some(crate::objects::FloatDrag { pos, page, grab: (0.0, 0.0), x: f.x, y: f.y, w: f.w, h: f.h, resize: true });
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    let Some((page, f)) = float_hit(app, geo, pointer) else { return false };
+    let pos = f.path.at(f.offset);
+    app.select(pos, Pos { offset: f.offset + 1, ..pos });
+    if resp.double_clicked() && f.text_box {
+        app.open_text_box_dialog();
+    } else if resp.drag_started() {
+        if let Some((_, x, y)) = geo.to_doc(app, pointer) {
+            app.float_drag = Some(crate::objects::FloatDrag { pos, page, grab: (x - f.x, y - f.y), x: f.x, y: f.y, w: f.w, h: f.h, resize: false });
+        }
+    }
+    true
 }
 
 fn image_at(app: &App, pos: Pos) -> Option<Inline> {
@@ -724,6 +837,15 @@ fn command_key(app: &mut App, key: Key, m: Modifiers) {
 fn context_menu(app: &mut App, resp: &egui::Response) {
     resp.context_menu(|ui| {
         ui.set_min_width(200.0);
+        // Picture / text box options.
+        if let Some((_, obj)) = app.selected_object() {
+            if matches!(obj, Inline::TextBox(_)) && ui.button("Edit Text Box...").clicked() {
+                app.open_text_box_dialog();
+                ui.close();
+            }
+            ui.menu_button("Wrap Text", |ui| crate::ribbon::wrap_menu(app, ui));
+            ui.separator();
+        }
         // Spelling suggestions first.
         if crate::proof::context_suggestions(app, ui) {
             ui.separator();

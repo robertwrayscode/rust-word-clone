@@ -136,6 +136,7 @@ pub struct App {
     pub focus_search: bool,
     pub search_text: String,
     pub zoom_mode: Option<ZoomMode>,
+    pub float_drag: Option<crate::objects::FloatDrag>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -201,6 +202,7 @@ impl App {
             focus_search: false,
             search_text: String::new(),
             zoom_mode: None,
+            float_drag: None,
         };
         app.doc.settings.author = crate::fileio::user_name();
         if args.demo {
@@ -403,6 +405,10 @@ impl App {
     // -------------------------------------------------------------------
 
     /// Delete the selection if any; returns true if something was deleted.
+    pub fn delete_selection_pub(&mut self) -> bool {
+        self.delete_selection()
+    }
+
     fn delete_selection(&mut self) -> bool {
         if self.sel.is_empty() {
             return false;
@@ -911,7 +917,7 @@ impl App {
         for (p, cur) in updates {
             let step = 36.0;
             let nv = if dir > 0 { ((cur / step).floor() + 1.0) * step } else { (((cur - 0.01) / step).ceil() - 1.0).max(0.0) * step };
-            let maxw = self.doc.page.text_width() - 36.0;
+            let maxw = self.page_setup().text_width() - 36.0;
             if let Some(x) = self.doc.para_mut(&p) {
                 x.props.indent_left = Some(nv.min(maxw));
             }
@@ -1086,7 +1092,7 @@ impl App {
         self.delete_selection();
         let pos = self.sel.head;
         let story = pos.path.story;
-        let width = self.doc.page.column_width();
+        let width = self.page_setup().column_width();
         let mut t = Table::new(rows, cols, width);
         // Use the current paragraph's style formatting in cells: plain Normal without spacing after.
         for r in &mut t.rows {
@@ -1337,7 +1343,7 @@ impl App {
 
     pub fn insert_image(&mut self, data: ImageData, label: &str) {
         let (w, h) = data.pixel_size.map(|(w, h)| (w as f32 * 0.75, h as f32 * 0.75)).unwrap_or((200.0, 150.0));
-        let maxw = self.doc.page.column_width();
+        let maxw = self.page_setup().column_width();
         let s = if w > maxw { maxw / w } else { 1.0 };
         let img = Image { data: Arc::new(data), width: w * s, height: h * s, alt: String::new(), float: None };
         self.insert_inline(Inline::Image(img), label);
@@ -1498,7 +1504,7 @@ impl App {
         let existing = blocks.iter().position(is_toc);
         self.checkpoint("Table of Contents", EditKind::Other);
         let mut paras = vec![Block::Para(Paragraph::with_style("TOCHeading", "Contents"))];
-        let tw = self.doc.page.text_width();
+        let tw = self.page_setup().text_width();
         for h in &headings {
             let page = self.layout.pages.get(h.page).map(|p| p.number).unwrap_or(1);
             let mut p = Paragraph::with_style(&format!("TOC{}", h.level + 1), &h.text);
@@ -1577,18 +1583,16 @@ impl App {
     // Headers / footers
     // -------------------------------------------------------------------
 
-    pub fn edit_header(&mut self, footer: bool, first_page: bool) {
-        let story = match (footer, first_page && self.doc.page.title_page) {
-            (false, false) => Story::Header,
-            (true, false) => Story::Footer,
-            (false, true) => Story::FirstHeader,
-            (true, true) => Story::FirstFooter,
-        };
+    /// Start editing the header or footer of `page` (default: the caret's page).
+    pub fn edit_header(&mut self, footer: bool, page: Option<usize>) {
+        let page = page.unwrap_or_else(|| self.layout.page_of(self.sel.head).unwrap_or(0));
+        let story = self.hf_story_for_page(footer, page);
         if self.doc.story(story).is_empty() {
             self.checkpoint("Header", EditKind::Other);
             let style = if footer { "Footer" } else { "Header" };
             self.doc.story_mut(story).push(Block::Para(Paragraph::with_style(style, "")));
             self.changed();
+            self.relayout();
         }
         let end = self.doc.end_of(story);
         self.set_caret(end, false);
@@ -1605,7 +1609,8 @@ impl App {
     /// Insert page numbers into the header or footer (`pos`: 0 left, 1 centre, 2 right).
     pub fn insert_page_numbers(&mut self, footer: bool, align: Align, with_total: bool) {
         self.checkpoint("Page Number", EditKind::Other);
-        let story = if footer { Story::Footer } else { Story::Header };
+        let sec = self.current_section();
+        let story = self.doc.header_story(sec, if footer { HfKind::Footer } else { HfKind::Header });
         let mut p = Paragraph::with_style(if footer { "Footer" } else { "Header" }, "");
         p.props.align = Some(align);
         if with_total {
@@ -1623,8 +1628,8 @@ impl App {
         } else {
             blocks.push(Block::Para(p));
         }
-        if self.doc.page.title_page {
-            let fs = if footer { Story::FirstFooter } else { Story::FirstHeader };
+        if self.doc.section_page(sec).title_page {
+            let fs = self.doc.header_story(sec, if footer { HfKind::FirstFooter } else { HfKind::FirstHeader });
             let copy = self.doc.story(story).clone();
             *self.doc.story_mut(fs) = copy;
         }
@@ -1919,12 +1924,6 @@ fn cur_diff(probe: &CharProps, cur: &CharProps) -> CharProps {
 }
 
 impl App {
-    pub fn set_page_setup(&mut self, s: PageSetup) {
-        self.checkpoint("Page Setup", EditKind::Other);
-        self.doc.page = s;
-        self.changed();
-    }
-
     /// Apply a document theme: heading font, body font and accent colour.
     pub fn apply_theme(&mut self, heading_font: &str, body_font: &str, color: Color) {
         self.checkpoint("Theme", EditKind::Other);
