@@ -189,3 +189,14 @@ fn readers_survive_truncated_input() {
         let _ = io::rtf::read(junk.as_bytes());
     }
 }
+
+#[test]
+fn text_box_paragraphs_in_plain_formats() {
+    let doc = sections_doc();
+    let t = wordcore::io::txt::write(&doc);
+    let lines: Vec<&str> = t.lines().collect();
+    let i = lines.iter().position(|l| *l == "Anchor of the box").unwrap();
+    assert_eq!(&lines[i + 1..i + 3], &["Box line one", "Box line two"]);
+    let md = wordcore::io::markdown::write(&doc);
+    assert!(md.contains("Anchor of the box\n\n> Box line one\n>\n> Box line two\n"), "{md}");
+}

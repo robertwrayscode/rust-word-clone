@@ -112,6 +112,16 @@ pub fn blocks_to_text(blocks: &[Block]) -> String {
                 let mut s = String::new();
                 para_text(p, &mut s);
                 lines.push(s);
+                // Text box contents follow their anchor paragraph.
+                for r in &p.runs {
+                    if let Inline::TextBox(tb) = &r.content {
+                        for q in &tb.paragraphs {
+                            let mut s = String::new();
+                            para_text(q, &mut s);
+                            lines.push(s);
+                        }
+                    }
+                }
             }
             Block::Table(t) => {
                 for r in &t.rows {

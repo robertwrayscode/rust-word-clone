@@ -272,3 +272,30 @@ fn html_libreoffice_interop() {
     assert!(d2.plain_text().contains("Fancy paragraph"));
     assert!(d2.plain_text().contains("Span two"));
 }
+
+#[test]
+fn html_sections_floats_textboxes() {
+    let doc = sections_doc();
+    let s = html::write(&doc);
+    // Square picture at x=36 from the margin floats left; the centred Behind picture is a centred block.
+    assert!(s.contains("float:left;margin:0 9pt 9pt 0"), "{}", &s[..s.len().min(400)]);
+    assert!(s.contains("display:block;margin:0pt auto"));
+    // The text box precedes its anchor paragraph as a floating div (x=270 of a 468pt column → right).
+    let tb = s.find("<div class=\"textbox\"").expect("text box div");
+    let anchor = s.find("Anchor of the box").unwrap();
+    assert!(tb < anchor);
+    let div = &s[tb..s[tb..].find("</div>").unwrap() + tb];
+    assert!(div.contains("float:right") && div.contains("background-color:#FFF2CC") && div.contains("border:1.5pt solid #C00000"), "{div}");
+    assert!(div.contains("Box line one") && div.contains("Box line two"));
+    // Next-page section breaks become page breaks; the continuous one does not.
+    let back = html::read(&s);
+    assert_eq!(find_para(&back, "Section two text").props.page_break_before, Some(true));
+    assert_eq!(find_para(&back, "Section three text").props.page_break_before, None);
+    // Floating pictures come back as left/right floats.
+    let img = body_paras(&back).iter().flat_map(|p| p.runs.iter()).find_map(|r| if let Inline::Image(i) = &r.content { Some(i.clone()) } else { None }).unwrap();
+    let f = img.float.expect("float");
+    assert_eq!((f.wrap, f.h_rel, f.h_align), (WrapMode::Square, HRel::Column, Some(FloatAlign::Start)));
+    let d = html::read(r#"<p><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==" style="float:right;width:10pt;height:10pt">x</p>"#);
+    let Inline::Image(i) = &d.body[0].as_para().unwrap().runs[0].content else { panic!() };
+    assert_eq!(i.float.unwrap().h_align, Some(FloatAlign::End));
+}
