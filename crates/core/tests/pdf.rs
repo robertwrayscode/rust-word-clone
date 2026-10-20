@@ -317,6 +317,7 @@ fn hand_built_layout() {
         body_top: 72.0,
         body_bottom: 770.0,
         comment_marks: Vec::new(),
+        ..Default::default()
     };
     let l = DocLayout { pages: vec![page], ..Default::default() };
     let pdf = export(&l, &db, &DocProperties::default());

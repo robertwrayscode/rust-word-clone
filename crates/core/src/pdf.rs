@@ -311,17 +311,7 @@ impl Exporter<'_> {
         let blank;
         let blank_ref;
         let pages: &[&Page] = if pages.is_empty() {
-            blank = Page {
-                index: 0,
-                number: 1,
-                width: 612.0,
-                height: 792.0,
-                shapes: Vec::new(),
-                lines: Vec::new(),
-                body_top: 72.0,
-                body_bottom: 720.0,
-                comment_marks: Vec::new(),
-            };
+            blank = Page { index: 0, number: 1, width: 612.0, height: 792.0, body_top: 72.0, body_bottom: 720.0, ..Default::default() };
             blank_ref = &blank;
             std::slice::from_ref(&blank_ref)
         } else {
