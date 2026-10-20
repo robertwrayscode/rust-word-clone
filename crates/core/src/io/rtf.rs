@@ -29,6 +29,10 @@ struct RtfWriter<'a> {
     counter: ListCounter,
     comment_ranges: HashMap<u32, (usize, usize)>,
     run_counter: usize,
+    /// `\sectd` + properties + headers of every section (index = section).
+    sect_heads: Vec<String>,
+    sect_idx: usize,
+    shape_id: usize,
 }
 
 /// Escape text for RTF (ASCII output: cp1252 as `\'hh`, everything else as `\uN?`).
@@ -275,11 +279,21 @@ impl<'a> RtfWriter<'a> {
     }
 
     fn blocks(&mut self, out: &mut String, blocks: &[Block], body: bool) {
+        let top = body && std::ptr::eq(blocks.as_ptr(), self.doc.body.as_ptr());
         for b in blocks {
             match b {
                 Block::Para(p) => {
                     self.paragraph(out, p, false, body);
-                    out.push_str("\\par\n");
+                    if top && p.section.is_some() {
+                        // The section break takes the place of the paragraph mark.
+                        self.sect_idx += 1;
+                        out.push_str("\\sect\n");
+                        if let Some(h) = self.sect_heads.get(self.sect_idx) {
+                            out.push_str(h);
+                        }
+                    } else {
+                        out.push_str("\\par\n");
+                    }
                 }
                 Block::Table(t) => self.table(out, t, body),
             }
@@ -356,7 +370,6 @@ impl<'a> RtfWriter<'a> {
                 _ => out.push_str("\\page "),
             },
             Inline::ColumnBreak => out.push_str("\\column "),
-            Inline::TextBox(_) => {}
             Inline::Bookmark(n) => {
                 out.push_str("{\\*\\bkmkstart ");
                 rtf_text(out, n);
@@ -385,37 +398,68 @@ impl<'a> RtfWriter<'a> {
                 rtf_text(out, &result);
                 out.push_str("}}}");
             }
-            Inline::Image(img) => {
-                let kind = match img.data.format.as_str() {
-                    "png" => "\\pngblip",
-                    "jpeg" | "jpg" => "\\jpegblip",
-                    "emf" => "\\emfblip",
-                    "wmf" => "\\wmetafile8",
-                    _ => {
-                        // No RTF encoding for this format: keep the alt text.
-                        let _ = write!(out, "{{{} ", fmt);
-                        rtf_text(out, &format!("[{}]", if img.alt.is_empty() { "image" } else { &img.alt }));
-                        out.push('}');
-                        return;
-                    }
-                };
-                let (pw, ph) = img.data.pixel_size.unwrap_or(((img.width / 0.75) as u32, (img.height / 0.75) as u32));
-                let _ = writeln!(
-                    out,
-                    "{{\\*\\shppict{{\\pict{}\\picw{}\\pich{}\\picwgoal{}\\pichgoal{}",
-                    kind,
-                    pw,
-                    ph,
-                    tw(img.width),
-                    tw(img.height)
-                );
-                for chunk in img.data.bytes.chunks(64) {
-                    for b in chunk {
-                        let _ = write!(out, "{:02x}", b);
-                    }
-                    out.push('\n');
+            Inline::Image(img) => match (pict_rtf(img), &img.float) {
+                (None, _) => {
+                    // No RTF encoding for this format: keep the alt text.
+                    let _ = write!(out, "{{{} ", fmt);
+                    rtf_text(out, &format!("[{}]", if img.alt.is_empty() { "image" } else { &img.alt }));
+                    out.push('}');
                 }
-                out.push_str("}}");
+                (Some(pict), None) => {
+                    let _ = write!(out, "{{\\*\\shppict{}}}", pict);
+                }
+                (Some(pict), Some(f)) => {
+                    let mut extra = format!("{{\\sp{{\\sn shapeType}}{{\\sv 75}}}}{{\\sp{{\\sn pib}}{{\\sv {}}}}}", pict);
+                    if !img.alt.is_empty() {
+                        extra.push_str("{\\sp{\\sn wzDescription}{\\sv ");
+                        rtf_text(&mut extra, &img.alt);
+                        extra.push_str("}}");
+                    }
+                    self.shape(out, Some(f), img.width, img.height, &extra, "");
+                    // Readers without shape support show the picture in line.
+                    let _ = write!(out, "{{\\shprslt{{\\*\\shppict{}}}}}}}", pict);
+                }
+            },
+            Inline::TextBox(tb) => {
+                let mut extra = String::from("{\\sp{\\sn shapeType}{\\sv 202}}{\\sp{\\sn fTextBox}{\\sv 1}}");
+                match tb.fill {
+                    Some(c) => {
+                        let _ = write!(extra, "{{\\sp{{\\sn fillColor}}{{\\sv {}}}}}{{\\sp{{\\sn fFilled}}{{\\sv 1}}}}", bgr(c));
+                    }
+                    None => extra.push_str("{\\sp{\\sn fFilled}{\\sv 0}}"),
+                }
+                match tb.border.filter(|b| b.is_visible()) {
+                    Some(b) => {
+                        let _ = write!(
+                            extra,
+                            "{{\\sp{{\\sn lineColor}}{{\\sv {}}}}}{{\\sp{{\\sn lineWidth}}{{\\sv {}}}}}{{\\sp{{\\sn fLine}}{{\\sv 1}}}}",
+                            bgr(b.color),
+                            emu(b.width)
+                        );
+                    }
+                    None => extra.push_str("{\\sp{\\sn fLine}{\\sv 0}}"),
+                }
+                let ins = emu(tb.padding.max(0.0));
+                let _ = write!(
+                    extra,
+                    "{{\\sp{{\\sn dxTextLeft}}{{\\sv {ins}}}}}{{\\sp{{\\sn dxTextRight}}{{\\sv {ins}}}}}{{\\sp{{\\sn dyTextTop}}{{\\sv {}}}}}{{\\sp{{\\sn dyTextBottom}}{{\\sv {}}}}}",
+                    emu(tb.padding / 2.0),
+                    emu(tb.padding / 2.0)
+                );
+                if tb.auto_height {
+                    extra.push_str("{\\sp{\\sn fFitShapeToText}{\\sv 1}}");
+                }
+                let mut text = String::from("{\\shptxt ");
+                let paras: Vec<Paragraph> = if tb.paragraphs.is_empty() { vec![Paragraph::new()] } else { tb.paragraphs.clone() };
+                for (i, p) in paras.iter().enumerate() {
+                    if i > 0 {
+                        text.push_str("\\par\n");
+                    }
+                    self.paragraph(&mut text, p, false, false);
+                }
+                text.push('}');
+                self.shape(out, tb.float.as_ref(), tb.width, tb.height, &extra, &text);
+                out.push('}');
             }
             Inline::FootnoteRef(id) | Inline::EndnoteRef(id) => {
                 let foot = matches!(r.content, Inline::FootnoteRef(_));
@@ -618,6 +662,141 @@ impl<'a> RtfWriter<'a> {
 }
 
 /// Encode an ISO 8601 date as an RTF DTTM value.
+fn bgr(c: Color) -> u32 {
+    c.r as u32 | (c.g as u32) << 8 | (c.b as u32) << 16
+}
+
+/// `{\pict …}` for an image (None when RTF cannot carry its format).
+fn pict_rtf(img: &Image) -> Option<String> {
+    let kind = match img.data.format.as_str() {
+        "png" => "\\pngblip",
+        "jpeg" | "jpg" => "\\jpegblip",
+        "emf" => "\\emfblip",
+        "wmf" => "\\wmetafile8",
+        _ => return None,
+    };
+    let (pw, ph) = img.data.pixel_size.unwrap_or(((img.width / 0.75) as u32, (img.height / 0.75) as u32));
+    let mut out = format!("{{\\pict{}\\picw{}\\pich{}\\picwgoal{}\\pichgoal{}\n", kind, pw, ph, tw(img.width), tw(img.height));
+    for chunk in img.data.bytes.chunks(64) {
+        for b in chunk {
+            let _ = write!(out, "{:02x}", b);
+        }
+        out.push('\n');
+    }
+    out.push('}');
+    Some(out)
+}
+
+impl<'a> RtfWriter<'a> {
+    /// Open a `{\shp{\*\shpinst …}` group (the caller closes it). `float` None = in line with text.
+    fn shape(&mut self, out: &mut String, float: Option<&Float>, w: f32, h: f32, props: &str, inner: &str) {
+        self.shape_id += 1;
+        let f = float.copied().unwrap_or(Float { wrap: WrapMode::InFront, h_rel: HRel::Character, v_rel: VRel::Line, ..Default::default() });
+        let (x, y) = (if f.h_align.is_some() { 0.0 } else { f.x }, if f.v_align.is_some() { 0.0 } else { f.y });
+        let _ = write!(out, "{{\\shp{{\\*\\shpinst\\shpleft{}\\shptop{}\\shpright{}\\shpbottom{}\\shpfhdr0", tw(x), tw(y), tw(x + w), tw(y + h));
+        // Like Word: the legacy anchor keyword, then "ignore" so the posrelh/posrelv properties apply.
+        out.push_str(match f.h_rel {
+            HRel::Page => "\\shpbxpage\\shpbxignore",
+            HRel::Margin => "\\shpbxmargin\\shpbxignore",
+            HRel::Column | HRel::Character => "\\shpbxcolumn\\shpbxignore",
+        });
+        out.push_str(match f.v_rel {
+            VRel::Page => "\\shpbypage\\shpbyignore",
+            VRel::Margin => "\\shpbymargin\\shpbyignore",
+            VRel::Paragraph | VRel::Line => "\\shpbypara\\shpbyignore",
+        });
+        let (wr, behind) = match f.wrap {
+            WrapMode::Square => (2, 0),
+            WrapMode::Tight => (4, 0),
+            WrapMode::TopBottom => (1, 0),
+            WrapMode::Behind => (3, 1),
+            WrapMode::InFront => (3, 0),
+        };
+        let _ = write!(out, "\\shpwr{}\\shpwrk0\\shpfblwtxt{}\\shpz{}\\shplid{}", wr, behind, self.shape_id, 1024 + self.shape_id);
+        let posrelh = match f.h_rel {
+            HRel::Margin => 0,
+            HRel::Page => 1,
+            HRel::Column => 2,
+            HRel::Character => 3,
+        };
+        let posrelv = match f.v_rel {
+            VRel::Margin => 0,
+            VRel::Page => 1,
+            VRel::Paragraph => 2,
+            VRel::Line => 3,
+        };
+        let _ = write!(out, "{{\\sp{{\\sn posrelh}}{{\\sv {}}}}}{{\\sp{{\\sn posrelv}}{{\\sv {}}}}}", posrelh, posrelv);
+        let posh = match f.h_align {
+            None => 0,
+            Some(FloatAlign::Start) => 1,
+            Some(FloatAlign::Center) => 2,
+            Some(FloatAlign::End) => 3,
+        };
+        let posv = match f.v_align {
+            None => 0,
+            Some(FloatAlign::Start) => 1,
+            Some(FloatAlign::Center) => 2,
+            Some(FloatAlign::End) => 3,
+        };
+        let _ = write!(out, "{{\\sp{{\\sn posh}}{{\\sv {}}}}}{{\\sp{{\\sn posv}}{{\\sv {}}}}}", posh, posv);
+        if behind == 1 {
+            out.push_str("{\\sp{\\sn fBehindDocument}{\\sv 1}}");
+        }
+        if float.is_none() {
+            out.push_str("{\\sp{\\sn fPseudoInline}{\\sv 1}}");
+        }
+        let d = emu(f.dist.max(0.0));
+        for n in ["dxWrapDistLeft", "dxWrapDistRight", "dyWrapDistTop", "dyWrapDistBottom"] {
+            let _ = write!(out, "{{\\sp{{\\sn {}}}{{\\sv {}}}}}", n, d);
+        }
+        out.push_str(props);
+        out.push_str(inner);
+        out.push('}');
+    }
+
+    /// `\sectd` and the section properties of a page setup.
+    fn sect_props(&mut self, p: &PageSetup) -> String {
+        let mut s = String::from("\\sectd");
+        s.push_str(match p.start {
+            SectionStart::NextPage => "\\sbkpage",
+            SectionStart::Continuous => "\\sbknone",
+            SectionStart::OddPage => "\\sbkodd",
+            SectionStart::EvenPage => "\\sbkeven",
+        });
+        if p.width > p.height {
+            s.push_str("\\lndscpsxn");
+        }
+        let _ = write!(
+            s,
+            "\\pgwsxn{}\\pghsxn{}\\marglsxn{}\\margrsxn{}\\margtsxn{}\\margbsxn{}\\headery{}\\footery{}",
+            tw(p.width),
+            tw(p.height),
+            tw(p.margin_left),
+            tw(p.margin_right),
+            tw(p.margin_top),
+            tw(p.margin_bottom),
+            tw(p.header_distance),
+            tw(p.footer_distance)
+        );
+        if p.columns > 1 {
+            let _ = write!(s, "\\cols{}\\colsx{}", p.columns, tw(p.column_gap));
+        }
+        if p.title_page {
+            s.push_str("\\titlepg");
+        }
+        if p.page_number_start != 1 {
+            let _ = write!(s, "\\pgnrestart\\pgnstarts{}", p.page_number_start);
+        }
+        if let Some(b) = p.page_borders.clone() {
+            for (tag, br) in [("pgbrdrt", &b.top), ("pgbrdrl", &b.left), ("pgbrdrb", &b.bottom), ("pgbrdrr", &b.right)] {
+                self.border(&mut s, tag, br);
+            }
+        }
+        s.push('\n');
+        s
+    }
+}
+
 fn dttm(date: &str) -> u32 {
     let n = |a: usize, b: usize| date.get(a..b).and_then(|s| s.parse::<u32>().ok());
     let (Some(y), Some(mo), Some(d)) = (n(0, 4), n(5, 7), n(8, 10)) else { return 0 };
@@ -652,6 +831,9 @@ pub fn write(doc: &Document) -> String {
         counter: ListCounter::default(),
         comment_ranges: HashMap::new(),
         run_counter: 0,
+        sect_heads: Vec::new(),
+        sect_idx: 0,
+        shape_id: 0,
     };
     let deff = doc.default_chars.font.clone().unwrap_or_else(|| "Calibri".into());
     w.font(&deff);
@@ -677,21 +859,41 @@ pub fn write(doc: &Document) -> String {
     }
     w.comment_ranges = ranges;
 
-    // Body first (fills the font / colour / style tables).
+    // Section properties and headers/footers (a section without header groups inherits its
+    // predecessor's, so groups are written where the displayed content changes; the first section
+    // always gets what it shows).
     let lists = w.list_table();
+    let secs = doc.sections();
+    let nsec = secs.len() + 1;
+    let mut prev: [Option<&Vec<Block>>; 4] = [None; 4];
+    for i in 0..nsec {
+        let (page, hf) = match secs.get(i) {
+            Some(s) => (&s.page, s.headers.as_ref().or(if i == 0 { Some(doc.section_headers(0)) } else { None })),
+            None => (&doc.page, Some(&doc.headers)),
+        };
+        let mut head = w.sect_props(page);
+        if let Some(hf) = hf {
+            let parts = [("header", HfKind::Header), ("footer", HfKind::Footer), ("headerf", HfKind::FirstHeader), ("footerf", HfKind::FirstFooter)];
+            for (k, (tag, kind)) in parts.into_iter().enumerate() {
+                let blocks = hf.part(kind);
+                let needed = match prev[k] {
+                    Some(p) => p != blocks,
+                    None => !blocks.is_empty(),
+                };
+                if !needed {
+                    continue;
+                }
+                prev[k] = Some(blocks);
+                let mut s = String::new();
+                w.blocks(&mut s, blocks, false);
+                let _ = writeln!(head, "{{\\{} {}}}", tag, s);
+            }
+        }
+        w.sect_heads.push(head);
+    }
+    // Body (fills the font / colour / style tables).
     let mut body = String::new();
     w.blocks(&mut body, &doc.body, true);
-    let mut hf = String::new();
-    let parts: [(&str, &Vec<Block>); 4] =
-        [("header", &doc.headers.header), ("footer", &doc.headers.footer), ("headerf", &doc.headers.first_header), ("footerf", &doc.headers.first_footer)];
-    for (tag, blocks) in parts {
-        if blocks.is_empty() || (tag.ends_with('f') && !doc.page.title_page) {
-            continue;
-        }
-        let mut s = String::new();
-        w.blocks(&mut s, blocks, false);
-        let _ = writeln!(hf, "{{\\{} {}}}", tag, s);
-    }
 
     let mut out = String::from("{\\rtf1\\ansi\\ansicpg1252\\deff0\\uc1\n");
     out.push_str("{\\fonttbl");
@@ -751,18 +953,17 @@ pub fn write(doc: &Document) -> String {
         }
     }
     out.push_str("}\n");
-    let pg = &doc.page;
+    // Document defaults: the first section's page.
+    let pg = doc.section_page(0);
     let _ = write!(
         out,
-        "\\paperw{}\\paperh{}\\margl{}\\margr{}\\margt{}\\margb{}\\headery{}\\footery{}\\deftab{}",
+        "\\paperw{}\\paperh{}\\margl{}\\margr{}\\margt{}\\margb{}\\deftab{}",
         tw(pg.width),
         tw(pg.height),
         tw(pg.margin_left),
         tw(pg.margin_right),
         tw(pg.margin_top),
         tw(pg.margin_bottom),
-        tw(pg.header_distance),
-        tw(pg.footer_distance),
         tw(doc.settings.default_tab)
     );
     if pg.width > pg.height {
@@ -771,25 +972,8 @@ pub fn write(doc: &Document) -> String {
     if doc.settings.track_changes {
         out.push_str("\\revisions");
     }
-    out.push_str("\\fet2\\ftnbj\\aenddoc\\sectd");
-    if pg.columns > 1 {
-        let _ = write!(out, "\\cols{}\\colsx{}", pg.columns, tw(pg.column_gap));
-    }
-    if pg.title_page {
-        out.push_str("\\titlepg");
-    }
-    if pg.page_number_start != 1 {
-        let _ = write!(out, "\\pgnstarts{}\\pgnrestart", pg.page_number_start);
-    }
-    if let Some(b) = pg.page_borders.clone() {
-        for (tag, br) in [("pgbrdrt", &b.top), ("pgbrdrl", &b.left), ("pgbrdrb", &b.bottom), ("pgbrdrr", &b.right)] {
-            let mut s = String::new();
-            w.border(&mut s, tag, br);
-            out.push_str(&s);
-        }
-    }
-    out.push('\n');
-    out.push_str(&hf);
+    out.push_str("\\fet2\\ftnbj\\aenddoc\n");
+    out.push_str(&w.sect_heads[0]);
     out.push_str(&body);
     out.push('}');
     // Colours or fonts added while writing the stylesheet/page borders: rebuild tables if they grew.
@@ -949,6 +1133,12 @@ enum Dest {
     AtrfStart,
     AtrfEnd,
     RevTbl,
+    /// Inside a `\shp` / `\shpinst`.
+    Shape,
+    /// A shape property `{\sp …}`, its name and value.
+    Sp,
+    Sn,
+    Sv,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -983,6 +1173,8 @@ struct GState {
     story: Option<StoryKind>,
     /// This group is a `\field`.
     field: bool,
+    /// This group is a `\shp`.
+    shape: bool,
     font_charset_symbol: bool,
     list_level_ref: Option<ListRef>,
     rev_author: Option<usize>,
@@ -999,6 +1191,8 @@ enum StoryKind {
     FirstHeader,
     FirstFooter,
     Annotation,
+    /// The text of a text box shape (`\shptxt`).
+    ShapeText,
     Skip,
 }
 
@@ -1075,11 +1269,34 @@ struct RtfReader {
     author_cur: String,
     skip_chars: usize,
     deff: i32,
-    break_next: bool,
     images: HashMap<u64, Arc<ImageData>>,
     pending_tab: (TabAlign, TabLeader),
     style_based: Option<i32>,
     style_based_pending: Vec<(String, i32)>,
+    /// Document-level page defaults (`\paperw` …) that `\sectd` restores; `doc.page` is the current section's.
+    def_page: PageSetup,
+    landscape: bool,
+    /// The current section has header/footer groups of its own.
+    own_headers: bool,
+    /// Finished sections: page setup, effective headers, own headers?
+    sections: Vec<(PageSetup, HeadersFooters, bool)>,
+    last_was_par: bool,
+    shape: Option<ShapeBuild>,
+}
+
+/// A `\shp` being read.
+#[derive(Default)]
+struct ShapeBuild {
+    rect: [i32; 4],
+    bx: Option<HRel>,
+    by: Option<VRel>,
+    wr: Option<i32>,
+    behind: bool,
+    props: HashMap<String, String>,
+    sn: String,
+    sv: String,
+    pict: Option<Image>,
+    text: Option<Vec<Paragraph>>,
 }
 
 /// Read an RTF document.
@@ -1102,6 +1319,7 @@ pub fn read(bytes: &[u8]) -> Result<Document, String> {
         in_table: false,
         story: None,
         field: false,
+        shape: false,
         font_charset_symbol: false,
         list_level_ref: None,
         rev_author: None,
@@ -1145,18 +1363,23 @@ pub fn read(bytes: &[u8]) -> Result<Document, String> {
         author_cur: String::new(),
         skip_chars: 0,
         deff: 0,
-        break_next: false,
         images: HashMap::new(),
         pending_tab: (TabAlign::Left, TabLeader::None),
         style_based: None,
         style_based_pending: Vec::new(),
+        def_page: PageSetup::default(),
+        landscape: false,
+        own_headers: false,
+        sections: Vec::new(),
+        last_was_par: false,
+        shape: None,
     };
     let mut expect_dest = false;
     for t in toks {
         match t {
             Tok::Open => {
                 let top = r.stack.last().cloned().unwrap();
-                r.stack.push(GState { story: None, field: false, ..top });
+                r.stack.push(GState { story: None, field: false, shape: false, ..top });
                 r.skip_chars = 0;
             }
             Tok::Close => {
@@ -1217,6 +1440,7 @@ pub fn read(bytes: &[u8]) -> Result<Document, String> {
             }
         }
     }
+    r.finish_sections(&mut story.blocks);
     let mut doc = r.doc;
     doc.body = story.blocks;
     if doc.body.is_empty() {
@@ -1284,12 +1508,17 @@ impl RtfReader {
             "atrfstart" => Some(Dest::AtrfStart),
             "atrfend" => Some(Dest::AtrfEnd),
             "revtbl" => Some(Dest::RevTbl),
+            "shpinst" if self.shape.is_some() => Some(Dest::Shape),
+            "sp" if self.shape.is_some() => Some(Dest::Sp),
+            "sn" if self.shape.is_some() => Some(Dest::Sn),
+            "sv" if self.shape.is_some() => Some(Dest::Sv),
+            "shprslt" if self.shape.is_some() => Some(Dest::Skip),
             "shppict" => Some(dest),
             "nonshppict" | "listtext" | "pntext" | "pn" | "listname" | "xmlnstbl" | "generator" | "themedata" | "colorschememapping"
             | "latentstyles" | "datastore" | "rsidtbl" | "mmathPr" | "pgdsctbl" | "falt" | "panose" | "fname" | "filetbl" | "objdata"
             | "result" | "userprops" | "docvar" | "ftnsep" | "ftnsepc" | "aftnsep" | "aftnsepc" | "headerl" | "footerl" | "headerr"
             | "footerr" | "tc" | "xe" | "template" | "company" | "manager" | "category" | "comment" | "hlinkbase" | "nesttableprops"
-            | "nonesttables" | "background" | "shp" | "shpinst" | "sp" | "sn" | "sv" | "wgrffmtfilter" | "fchars" | "lchars"
+            | "nonesttables" | "background" | "shpgrp" | "wgrffmtfilter" | "fchars" | "lchars"
             | "pgptbl" | "protusertbl" | "defchp" | "defpap" | "blipuid" | "picprop" | "bkmkcolf" | "bkmkcoll" | "atnicn" | "atntime"
             | "atnparent" | "formfield" | "ud" | "upr" | "do" => Some(Dest::Skip),
             _ => None,
@@ -1327,6 +1556,12 @@ impl RtfReader {
                         if kw == "HYPERLINK" {
                             f.link = rtf_hyperlink(&f.instr);
                         }
+                    }
+                }
+                "sp" => {
+                    if let Some(sh) = self.shape.as_mut() {
+                        sh.sn.clear();
+                        sh.sv.clear();
                     }
                 }
                 "list" => self.list_cur = (0, Vec::new()),
@@ -1447,6 +1682,31 @@ impl RtfReader {
             Dest::FldInst => {
                 return;
             }
+            Dest::Shape | Dest::Sp | Dest::Sn => {
+                if let Some(sh) = self.shape.as_mut() {
+                    match w {
+                        "shpleft" => sh.rect[0] = v,
+                        "shptop" => sh.rect[1] = v,
+                        "shpright" => sh.rect[2] = v,
+                        "shpbottom" => sh.rect[3] = v,
+                        "shpbxpage" => sh.bx = Some(HRel::Page),
+                        "shpbxmargin" => sh.bx = Some(HRel::Margin),
+                        "shpbxcolumn" => sh.bx = Some(HRel::Column),
+                        "shpbxignore" => sh.bx = None,
+                        "shpbypage" => sh.by = Some(VRel::Page),
+                        "shpbymargin" => sh.by = Some(VRel::Margin),
+                        "shpbypara" => sh.by = Some(VRel::Paragraph),
+                        "shpbyignore" => sh.by = None,
+                        "shpwr" => sh.wr = Some(v),
+                        "shpfblwtxt" => sh.behind = v != 0,
+                        "shptxt" => {
+                            self.open_story(StoryKind::ShapeText);
+                        }
+                        _ => {}
+                    }
+                }
+                return;
+            }
             _ => {}
         }
         self.format_word(w, p, v, on);
@@ -1458,15 +1718,36 @@ impl RtfReader {
         match w {
             // Document / section.
             "deff" => self.deff = v,
-            "paperw" | "pgwsxn" => self.doc.page.width = v as f32 / 20.0,
-            "paperh" | "pghsxn" => self.doc.page.height = v as f32 / 20.0,
-            "margl" | "marglsxn" => self.doc.page.margin_left = v as f32 / 20.0,
-            "margr" | "margrsxn" => self.doc.page.margin_right = v as f32 / 20.0,
-            "margt" | "margtsxn" => self.doc.page.margin_top = v as f32 / 20.0,
-            "margb" | "margbsxn" => self.doc.page.margin_bottom = v as f32 / 20.0,
+            "paperw" | "paperh" | "margl" | "margr" | "margt" | "margb" => {
+                // Document defaults also apply to the current section.
+                let val = v as f32 / 20.0;
+                for pg in [&mut self.def_page, &mut self.doc.page] {
+                    match w {
+                        "paperw" => pg.width = val,
+                        "paperh" => pg.height = val,
+                        "margl" => pg.margin_left = val,
+                        "margr" => pg.margin_right = val,
+                        "margt" => pg.margin_top = val,
+                        _ => pg.margin_bottom = val,
+                    }
+                }
+            }
+            "pgwsxn" => self.doc.page.width = v as f32 / 20.0,
+            "pghsxn" => self.doc.page.height = v as f32 / 20.0,
+            "marglsxn" => self.doc.page.margin_left = v as f32 / 20.0,
+            "margrsxn" => self.doc.page.margin_right = v as f32 / 20.0,
+            "margtsxn" => self.doc.page.margin_top = v as f32 / 20.0,
+            "margbsxn" => self.doc.page.margin_bottom = v as f32 / 20.0,
             "headery" => self.doc.page.header_distance = v as f32 / 20.0,
             "footery" => self.doc.page.footer_distance = v as f32 / 20.0,
             "landscape" | "lndscpsxn" => {
+                self.landscape = true;
+                if w == "landscape" {
+                    let pg = &mut self.def_page;
+                    if pg.width < pg.height {
+                        std::mem::swap(&mut pg.width, &mut pg.height);
+                    }
+                }
                 let pg = &mut self.doc.page;
                 if pg.width < pg.height {
                     std::mem::swap(&mut pg.width, &mut pg.height);
@@ -1478,7 +1759,21 @@ impl RtfReader {
             "pgnstarts" => self.doc.page.page_number_start = v.max(0) as u32,
             "deftab" => self.doc.settings.default_tab = (v as f32 / 20.0).max(1.0),
             "revisions" => self.doc.settings.track_changes = true,
-            "sect" => self.break_next = true,
+            "sbknone" => self.doc.page.start = SectionStart::Continuous,
+            "sbkpage" | "sbkcol" => self.doc.page.start = SectionStart::NextPage,
+            "sbkodd" => self.doc.page.start = SectionStart::OddPage,
+            "sbkeven" => self.doc.page.start = SectionStart::EvenPage,
+            "sectd" => {
+                // Section defaults: the document's page setup; headers stay inherited.
+                self.doc.page = PageSetup { page_borders: None, ..self.def_page.clone() };
+                self.landscape = false;
+            }
+            "sect" => self.end_section(),
+            "shp" => {
+                self.st().shape = true;
+                self.st().dest = Dest::Shape;
+                self.shape = Some(ShapeBuild::default());
+            }
             // Stories.
             "footnote" => self.open_story(StoryKind::Footnote),
             "ftnalt" => {
@@ -1753,6 +2048,7 @@ impl RtfReader {
                     self.finish_para(&mut s);
                 }
                 *self.story() = s;
+                self.last_was_par = true;
             }
             "line" => self.inline(Inline::LineBreak),
             "tab" => self.inline(Inline::Tab),
@@ -1898,6 +2194,17 @@ impl RtfReader {
             Dest::Info(_) | Dest::BkmkStart | Dest::BkmkEnd | Dest::AtnId | Dest::AtnAuthor | Dest::AtnRef | Dest::AtnDate | Dest::AtrfStart
             | Dest::AtrfEnd => self.info_text.push_str(s),
             Dest::Pict => self.pict_hex.push_str(s),
+            Dest::Shape | Dest::Sp => {}
+            Dest::Sn => {
+                if let Some(sh) = self.shape.as_mut() {
+                    sh.sn.push_str(s);
+                }
+            }
+            Dest::Sv => {
+                if let Some(sh) = self.shape.as_mut() {
+                    sh.sv.push_str(s);
+                }
+            }
             Dest::FldInst => {
                 if let Some(f) = self.fields.last_mut() {
                     f.instr.push_str(s);
@@ -1931,6 +2238,7 @@ impl RtfReader {
     }
 
     fn inline(&mut self, content: Inline) {
+        self.last_was_par = false;
         let props = self.current_props();
         if let Some(f) = self.fields.last_mut() {
             if !f.in_result {
@@ -1965,12 +2273,6 @@ impl RtfReader {
             p.props = self.st().para.clone();
         }
         p.props.style = p.props.style.filter(|x| x != "Normal");
-        if self.break_next {
-            self.break_next = false;
-            if !s.blocks.is_empty() {
-                p.props.page_break_before = Some(true);
-            }
-        }
         crate::io::docx::merge_runs(&mut p.runs);
         s.blocks.push(Block::Para(p));
     }
@@ -2121,6 +2423,15 @@ impl RtfReader {
                 self.info_text.clear();
             }
             Dest::Pict if parent_dest != Dest::Pict => self.finish_pict(),
+            Dest::Sp if parent_dest != Dest::Sp => {
+                if let Some(sh) = self.shape.as_mut() {
+                    let name = std::mem::take(&mut sh.sn).trim().to_string();
+                    let value = std::mem::take(&mut sh.sv).trim().to_string();
+                    if !name.is_empty() {
+                        sh.props.insert(name, value);
+                    }
+                }
+            }
             Dest::LevelText if parent_dest != Dest::LevelText => {}
             Dest::ListLevel if parent_dest != Dest::ListLevel => {
                 let lb = std::mem::take(&mut self.level_cur);
@@ -2207,6 +2518,9 @@ impl RtfReader {
             }
             _ => {}
         }
+        if st.shape {
+            self.finish_shape();
+        }
         if st.field {
             if let Some(f) = self.fields.pop() {
                 if f.swallow || !f.in_result {
@@ -2273,10 +2587,25 @@ impl RtfReader {
                     }
                     s.para.runs.push(Run { content, props });
                 }
-                StoryKind::Header => self.doc.headers.header = story.blocks,
-                StoryKind::Footer => self.doc.headers.footer = story.blocks,
-                StoryKind::FirstHeader => self.doc.headers.first_header = story.blocks,
-                StoryKind::FirstFooter => self.doc.headers.first_footer = story.blocks,
+                StoryKind::Header | StoryKind::Footer | StoryKind::FirstHeader | StoryKind::FirstFooter => {
+                    let slot = match kind {
+                        StoryKind::Header => HfKind::Header,
+                        StoryKind::Footer => HfKind::Footer,
+                        StoryKind::FirstHeader => HfKind::FirstHeader,
+                        _ => HfKind::FirstFooter,
+                    };
+                    *self.doc.headers.part_mut(slot) = story.blocks;
+                    self.own_headers = true;
+                }
+                StoryKind::ShapeText => {
+                    let mut paras = paras;
+                    if paras.is_empty() {
+                        paras.push(Paragraph::new());
+                    }
+                    if let Some(sh) = self.shape.as_mut() {
+                        sh.text = Some(paras);
+                    }
+                }
                 StoryKind::Annotation => {
                     let (initials, author, key, date) = std::mem::take(&mut self.atn);
                     let id = self.atn_ranges.get(&key).copied().unwrap_or_else(|| self.doc.next_comment_id());
@@ -2318,11 +2647,153 @@ impl RtfReader {
         }
         w *= self.pict_scale.0 / 100.0;
         h *= self.pict_scale.1 / 100.0;
+        let img = Image { data, width: w, height: h, alt: String::new(), float: None };
+        if let Some(sh) = self.shape.as_mut() {
+            if self.stack.iter().any(|g| g.dest == Dest::Sv) {
+                sh.pict = Some(img);
+                return;
+            }
+        }
         // Emit in the enclosing destination.
         let saved = self.st().dest;
         self.st().dest = Dest::Normal;
-        self.inline(Inline::Image(Image { data, width: w, height: h, alt: String::new(), float: None }));
+        self.inline(Inline::Image(img));
         self.st().dest = saved;
+    }
+
+    /// A finished `\shp`: a floating picture or text box.
+    fn finish_shape(&mut self) {
+        let Some(sh) = self.shape.take() else { return };
+        let prop = |n: &str| sh.props.get(n).and_then(|v| v.trim().parse::<i64>().ok());
+        let emu = |n: &str, d: f32| prop(n).map(|v| v as f32 / 12700.0).unwrap_or(d);
+        let color = |n: &str, d: Color| prop(n).map(|v| Color::rgb((v & 0xFF) as u8, ((v >> 8) & 0xFF) as u8, ((v >> 16) & 0xFF) as u8)).unwrap_or(d);
+        let width = (sh.rect[2] - sh.rect[0]) as f32 / 20.0;
+        let height = (sh.rect[3] - sh.rect[1]) as f32 / 20.0;
+        let float = if prop("fPseudoInline") == Some(1) {
+            None
+        } else {
+            let mut f = Float {
+                x: sh.rect[0] as f32 / 20.0,
+                y: sh.rect[1] as f32 / 20.0,
+                h_rel: sh.bx.unwrap_or(match prop("posrelh") {
+                    Some(0) => HRel::Margin,
+                    Some(1) => HRel::Page,
+                    Some(3) => HRel::Character,
+                    _ => HRel::Column,
+                }),
+                v_rel: sh.by.unwrap_or(match prop("posrelv") {
+                    Some(0) => VRel::Margin,
+                    Some(1) => VRel::Page,
+                    Some(3) => VRel::Line,
+                    _ => VRel::Paragraph,
+                }),
+                ..Default::default()
+            };
+            f.h_align = match prop("posh") {
+                Some(1 | 4) => Some(FloatAlign::Start),
+                Some(2) => Some(FloatAlign::Center),
+                Some(3 | 5) => Some(FloatAlign::End),
+                _ => None,
+            };
+            f.v_align = match prop("posv") {
+                Some(1 | 4) => Some(FloatAlign::Start),
+                Some(2) => Some(FloatAlign::Center),
+                Some(3 | 5) => Some(FloatAlign::End),
+                _ => None,
+            };
+            let behind = sh.behind || prop("fBehindDocument") == Some(1);
+            f.wrap = match sh.wr {
+                Some(1) => WrapMode::TopBottom,
+                Some(3) if behind => WrapMode::Behind,
+                Some(3) => WrapMode::InFront,
+                Some(4 | 5) => WrapMode::Tight,
+                _ => WrapMode::Square,
+            };
+            f.dist = ["dxWrapDistLeft", "dxWrapDistRight", "dyWrapDistTop", "dyWrapDistBottom"]
+                .iter()
+                .map(|n| emu(n, if n.starts_with("dx") { 9.0 } else { 0.0 }))
+                .fold(0.0, f32::max);
+            Some(f)
+        };
+        let content = if let Some(paragraphs) = sh.text {
+            let fill = if prop("fFilled") == Some(0) { None } else { Some(color("fillColor", Color::WHITE)) };
+            let border = if prop("fLine") == Some(0) {
+                None
+            } else {
+                Some(Border { style: BorderStyle::Single, width: emu("lineWidth", 0.75), color: color("lineColor", Color::BLACK), space: 0.0 })
+            };
+            Inline::TextBox(Box::new(TextBox {
+                paragraphs,
+                width: if width > 0.0 { width } else { 144.0 },
+                height: if height > 0.0 { height } else { 72.0 },
+                float,
+                fill,
+                border,
+                padding: emu("dxTextLeft", 7.2),
+                auto_height: prop("fFitShapeToText") == Some(1),
+            }))
+        } else if let Some(mut img) = sh.pict {
+            if width > 0.0 && height > 0.0 {
+                img.width = width;
+                img.height = height;
+            }
+            img.float = float;
+            img.alt = sh.props.get("wzDescription").cloned().unwrap_or_default();
+            Inline::Image(img)
+        } else {
+            return;
+        };
+        let saved = self.st().dest;
+        self.st().dest = Dest::Normal;
+        self.inline(content);
+        self.st().dest = saved;
+    }
+
+    /// `\sect`: the current paragraph ends the current section.
+    fn end_section(&mut self) {
+        if self.stories.len() != 1 || self.st().in_table {
+            return;
+        }
+        let mut s = std::mem::take(self.story());
+        // "…\par\sect": the section break belongs to the paragraph just finished.
+        let reuse = self.last_was_par && s.para.runs.is_empty() && s.table.is_none() && matches!(s.blocks.last(), Some(Block::Para(p)) if p.section.is_none());
+        if !reuse {
+            self.finish_para(&mut s);
+        }
+        if let Some(Block::Para(p)) = s.blocks.last_mut() {
+            p.section = Some(Box::default());
+        }
+        *self.story() = s;
+        let mut page = self.doc.page.clone();
+        if self.landscape && page.width < page.height {
+            std::mem::swap(&mut page.width, &mut page.height);
+        }
+        self.sections.push((page, self.doc.headers.clone(), std::mem::take(&mut self.own_headers)));
+    }
+
+    /// Fill in the section marks of the body (see [`Self::end_section`]).
+    fn finish_sections(&mut self, blocks: &mut [Block]) {
+        if self.landscape && self.doc.page.width < self.doc.page.height {
+            let pg = &mut self.doc.page;
+            std::mem::swap(&mut pg.width, &mut pg.height);
+        }
+        let last_hf = self.doc.headers.clone();
+        let mut decided: Vec<Option<HeadersFooters>> = Vec::new();
+        let mut out = Vec::new();
+        for (page, hf, own) in std::mem::take(&mut self.sections) {
+            let resolved = decided.iter().rev().find_map(|h| h.as_ref()).unwrap_or(&last_hf);
+            let headers = if own || *resolved != hf { Some(hf) } else { None };
+            decided.push(headers.clone());
+            out.push(Section { page, headers });
+        }
+        let mut it = out.into_iter();
+        for b in blocks.iter_mut() {
+            if let Block::Para(p) = b {
+                if p.section.is_some() {
+                    p.section = it.next().map(Box::new);
+                }
+            }
+        }
     }
 }
 

@@ -274,3 +274,67 @@ fn dump_kitchen_rtf() {
     std::fs::write("/tmp/claude-io-scratch/kitchen1.rtf", rtf::write(&d)).unwrap();
     std::fs::write("/tmp/claude-io-scratch/kitchen1.docx", io::docx::write(&d).unwrap()).unwrap();
 }
+
+#[test]
+fn rtf_roundtrip_sections_floats_textboxes() {
+    let doc = sections_doc();
+    let back = roundtrip(&doc);
+    check_sections_doc(&back, "rtf");
+    assert!(back.sections()[1].headers.is_none());
+    check_sections_doc(&roundtrip(&back), "rtf twice");
+    // "\par\sect" and "text\sect" both end a section at the right paragraph.
+    let d = rtf::read(br"{\rtf1\ansi\paperw12240\paperh15840 one\par\sect\sectd\sbknone\cols2 two\sect\sectd\lndscpsxn\pgwsxn15840\pghsxn12240 three\par}").unwrap();
+    let secs = d.sections();
+    assert_eq!(secs.len(), 2);
+    assert_eq!(d.body.len(), 3, "{:?}", d.body);
+    assert!(d.body[0].as_para().unwrap().section.is_some());
+    assert!(d.body[1].as_para().unwrap().section.is_some());
+    assert_eq!(secs[1].page.start, SectionStart::Continuous);
+    assert_eq!(secs[1].page.columns, 2);
+    assert_eq!(d.page.width, 792.0);
+    assert_eq!(d.page.columns, 1);
+    assert_eq!(d.page.start, SectionStart::NextPage);
+}
+
+#[test]
+fn rtf_sections_render_in_libreoffice() {
+    if !soffice_available() {
+        eprintln!("soffice not available; skipping");
+        return;
+    }
+    let dir = scratch_dir().join("rtf_sections_lo");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("sections.rtf");
+    std::fs::write(&path, rtf::write(&sections_doc())).unwrap();
+    let pdf = soffice_convert(&path, "pdf", &dir.join("pdf")).expect("LibreOffice could not convert the rtf");
+    pdf_to_png(&pdf, &dir.join("page"));
+    let sizes = pdf_page_sizes(&pdf);
+    assert!(sizes.len() >= 3, "{sizes:?}");
+    assert!((sizes[0].0 - 612.0).abs() < 1.0 && (sizes[0].1 - 792.0).abs() < 1.0, "{sizes:?}");
+    assert!((sizes[1].0 - 841.9).abs() < 1.5 && sizes[1].0 > sizes[1].1, "{sizes:?}");
+    if let Some(text) = pdf_text(&pdf) {
+        for needle in ["Box line one", "Box line two", "Header S1", "Footer S1", "Section two text", "Filler line 59"] {
+            assert!(text.contains(needle), "PDF lacks {needle:?}");
+        }
+    }
+    // LibreOffice's own RTF of the same document.
+    let lo = soffice_convert(&path, "rtf", &dir.join("resaved")).expect("re-save");
+    let back = io::open(&lo).unwrap();
+    assert_eq!(back.sections().len(), 2);
+    assert!((back.sections()[0].page.width - 612.0).abs() < 1.0);
+    assert!((back.sections()[1].page.width - 841.9).abs() < 1.0);
+    let tb = body_paras(&back)
+        .iter()
+        .flat_map(|p| p.runs.iter())
+        .find_map(|r| if let Inline::TextBox(t) = &r.content { Some(t.as_ref().clone()) } else { None })
+        .expect("no text box in LibreOffice's RTF");
+    assert_eq!(tb.paragraphs.iter().map(|p| p.text()).collect::<Vec<_>>(), vec!["Box line one", "Box line two"]);
+    let imgs: Vec<Image> = body_paras(&back).iter().flat_map(|p| p.runs.iter()).filter_map(|r| if let Inline::Image(i) = &r.content { Some(i.clone()) } else { None }).collect();
+    assert_eq!(imgs.len(), 2, "{imgs:?}");
+    let f = imgs[0].float.expect("picture not floating");
+    assert_eq!(f.wrap, WrapMode::Square);
+    assert_eq!(imgs[1].float.map(|f| f.wrap), Some(WrapMode::Behind));
+    let t = |b: &[Block]| b.iter().filter_map(|b| b.as_para()).map(|p| p.text()).collect::<String>();
+    assert_eq!(t(&back.section_headers(0).header), "Header S1");
+}
