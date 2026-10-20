@@ -359,12 +359,12 @@ impl AutoStyles {
         name
     }
 
-    /// `master`: attach the paragraph to the "Standard" master page (first paragraph of the body).
-    fn para(&mut self, parent: &str, p: &ParaProps, c: &CharProps, extra: &str, master: bool) -> String {
+    /// `master`: the master page this paragraph starts (first paragraph of a section).
+    fn para(&mut self, parent: &str, p: &ParaProps, c: &CharProps, extra: &str, master: Option<&str>) -> String {
         let pp = para_props_xml(p, extra);
         let tp = text_props_attrs(c);
         let parent_attr = if parent.is_empty() { String::new() } else { format!(r#" style:parent-style-name="{}""#, parent) };
-        let master = if master { r#" style:master-page-name="Standard""# } else { "" };
+        let master = master.map(|m| format!(r#" style:master-page-name="{}""#, esc_attr(m))).unwrap_or_default();
         let key = format!("{parent}|{pp}|{tp}|{master}");
         self.get("paragraph", "P", key, |name| {
             let mut s = format!(r#"<style:style style:name="{}" style:family="paragraph"{}{}>"#, name, parent_attr, master);
@@ -395,8 +395,20 @@ impl AutoStyles {
     }
 }
 
+/// How a section is written: with its own master page, or (a continuous section that only changes
+/// columns) as a `text:section` inside the previous section's page style.
+#[derive(Clone, Debug, PartialEq)]
+enum SecMode {
+    Master(String),
+    Region,
+}
+
 struct OdtWriter<'a> {
     doc: &'a Document,
+    sec_modes: Vec<SecMode>,
+    /// Master page (and page number) for the next top-level paragraph or table.
+    pending_master: Option<(String, Option<u32>)>,
+    region_id: usize,
     pictures: HashMap<usize, String>,
     picture_files: Vec<(String, Vec<u8>)>,
     frame_id: usize,
@@ -429,6 +441,9 @@ const NS: &str = concat!(
 pub fn write(doc: &Document) -> Result<Vec<u8>, String> {
     let mut w = OdtWriter {
         doc,
+        sec_modes: section_modes(doc),
+        pending_master: None,
+        region_id: 0,
         pictures: HashMap::new(),
         picture_files: Vec::new(),
         frame_id: 0,
@@ -468,14 +483,30 @@ pub fn write(doc: &Document) -> Result<Vec<u8>, String> {
     for l in &doc.lists {
         mauto.xml.push_str(&list_style_xml(&format!("L{}", l.id), l));
     }
-    let master = w.master_page(&mut mauto);
+    // One page layout + master page per section that starts a new page style; "Standard" is the
+    // last section's.
+    let mut layouts = String::new();
+    let mut masters = String::new();
+    let nsec = doc.section_count();
+    let mut has_standard = false;
+    for i in 0..nsec {
+        let SecMode::Master(name) = w.sec_modes[i].clone() else { continue };
+        let layout = format!("pm{}", i + 1);
+        layouts.push_str(&w.page_layout(&layout, doc.section_page(i), doc.section_headers(i)));
+        masters.push_str(&w.master_page(&name, &layout, doc.section_page(i), doc.section_headers(i), &mut mauto));
+        has_standard |= name == "Standard";
+    }
+    if !has_standard {
+        layouts.push_str(&w.page_layout("pm0", &doc.page, &doc.headers));
+        masters.push_str(&w.master_page("Standard", "pm0", &doc.page, &doc.headers, &mut mauto));
+    }
     let styles = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?><office:document-styles {NS}>{fonts}<office:styles>{named}</office:styles><office:automatic-styles>{layout}{mauto}</office:automatic-styles><office:master-styles>{master}</office:master-styles></office:document-styles>"#,
         fonts = w.font_decls(),
         named = w.named_styles(),
-        layout = w.page_layout(),
+        layout = layouts,
         mauto = mauto.xml,
-        master = master
+        master = masters
     );
 
     let p = &doc.properties;
@@ -527,6 +558,94 @@ pub fn write(doc: &Document) -> Result<Vec<u8>, String> {
     }
     z.add("META-INF/manifest.xml", manifest.as_bytes())?;
     z.finish()
+}
+
+/// Decide how each section is written (see [`SecMode`]).
+fn section_modes(doc: &Document) -> Vec<SecMode> {
+    let n = doc.section_count();
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let p = doc.section_page(i);
+        let region = i > 0 && p.start == SectionStart::Continuous && {
+            let q = doc.section_page(i - 1);
+            let same = PageSetup { columns: q.columns, column_gap: q.column_gap, start: q.start, page_number_start: q.page_number_start, ..p.clone() };
+            same == *q && doc.section_headers(i) == doc.section_headers(i - 1) && p.page_number_start == 1
+        };
+        // ODF has no continuous/odd/even page-style switches; the kind is kept in the master page's name
+        // (LibreOffice starts a new page).
+        out.push(match p.start {
+            _ if region => SecMode::Region,
+            SectionStart::Continuous if i > 0 => SecMode::Master(format!("RW_Continuous{}", i + 1)),
+            SectionStart::OddPage if i > 0 => SecMode::Master(format!("RW_OddPage{}", i + 1)),
+            SectionStart::EvenPage if i > 0 => SecMode::Master(format!("RW_EvenPage{}", i + 1)),
+            _ if i + 1 == n => SecMode::Master("Standard".into()),
+            _ => SecMode::Master(format!("RW_Section{}", i + 1)),
+        });
+    }
+    out
+}
+
+/// `text:anchor-type` and offsets of a floating frame.
+fn frame_anchor(f: &Float) -> String {
+    let anchor = if f.h_rel == HRel::Character || f.v_rel == VRel::Line { "char" } else { "paragraph" };
+    let mut s = format!(r#"text:anchor-type="{}""#, anchor);
+    if f.h_align.is_none() {
+        let _ = write!(s, r#" svg:x="{}""#, pt(f.x));
+    }
+    if f.v_align.is_none() {
+        let _ = write!(s, r#" svg:y="{}""#, pt(f.y));
+    }
+    s
+}
+
+fn z_index(f: Option<&Float>, id: usize) -> usize {
+    match f.map(|f| f.wrap) {
+        Some(WrapMode::Behind) => 0,
+        _ => id,
+    }
+}
+
+/// Automatic graphic style for a floating frame; `extra`: further graphic-properties attributes.
+fn frame_style(auto: &mut AutoStyles, f: &Float, extra: &str) -> String {
+    let (wrap, run) = match f.wrap {
+        WrapMode::Square => (r#"style:wrap="parallel" style:wrap-contour="false""#, ""),
+        WrapMode::Tight => (r#"style:wrap="parallel" style:wrap-contour="true" style:wrap-contour-mode="outside""#, ""),
+        WrapMode::TopBottom => (r#"style:wrap="none""#, ""),
+        WrapMode::Behind => (r#"style:wrap="run-through""#, r#" style:run-through="background""#),
+        WrapMode::InFront => (r#"style:wrap="run-through""#, r#" style:run-through="foreground""#),
+    };
+    let hpos = match f.h_align {
+        Some(FloatAlign::Start) => "left",
+        Some(FloatAlign::Center) => "center",
+        Some(FloatAlign::End) => "right",
+        None => "from-left",
+    };
+    let vpos = match f.v_align {
+        Some(FloatAlign::Start) => "top",
+        Some(FloatAlign::Center) => "middle",
+        Some(FloatAlign::End) => "bottom",
+        None => "from-top",
+    };
+    let hrel = match f.h_rel {
+        HRel::Page => "page",
+        HRel::Margin => "page-content",
+        HRel::Column => "paragraph",
+        HRel::Character => "char",
+    };
+    let vrel = match f.v_rel {
+        VRel::Page => "page",
+        VRel::Margin => "page-content",
+        VRel::Paragraph => "paragraph",
+        VRel::Line => "line",
+    };
+    let d = pt(f.dist);
+    let props = format!(
+        r#"{wrap}{run} style:number-wrapped-paragraphs="no-limit" style:vertical-pos="{vpos}" style:vertical-rel="{vrel}" style:horizontal-pos="{hpos}" style:horizontal-rel="{hrel}" fo:margin-left="{d}" fo:margin-right="{d}" fo:margin-top="{d}" fo:margin-bottom="{d}" style:flow-with-text="false"{extra}"#
+    );
+    let parent = if extra.is_empty() { "Graphics" } else { "Frame" };
+    auto.get("graphic", "fr", format!("{parent}|{props}"), |name| {
+        format!(r#"<style:style style:name="{}" style:family="graphic" style:parent-style-name="{}"><style:graphic-properties {}/></style:style>"#, name, parent, props)
+    })
 }
 
 fn list_style_xml(name: &str, l: &ListDef) -> String {
@@ -693,23 +812,24 @@ impl<'a> OdtWriter<'a> {
         }
         // Graphic style for inline images.
         s.push_str(r#"<style:style style:name="Graphics" style:family="graphic"><style:graphic-properties text:anchor-type="as-char" svg:y="0in" style:vertical-pos="top" style:vertical-rel="baseline"/></style:style>"#);
+        // Parent style for text boxes.
+        s.push_str(r#"<style:style style:name="Frame" style:family="graphic"><style:graphic-properties text:anchor-type="paragraph" svg:x="0pt" svg:y="0pt" style:wrap="parallel" style:number-wrapped-paragraphs="no-limit" style:vertical-pos="top" style:vertical-rel="paragraph-content" style:horizontal-pos="center" style:horizontal-rel="paragraph-content"/></style:style>"#);
         s
     }
 
-    fn has_hf(&self) -> (bool, bool) {
-        let d = self.doc;
-        let h = !d.headers.header.is_empty() || (d.page.title_page && !d.headers.first_header.is_empty());
-        let f = !d.headers.footer.is_empty() || (d.page.title_page && !d.headers.first_footer.is_empty());
+    fn has_hf(p: &PageSetup, hf: &HeadersFooters) -> (bool, bool) {
+        let h = !hf.header.is_empty() || (p.title_page && !hf.first_header.is_empty());
+        let f = !hf.footer.is_empty() || (p.title_page && !hf.first_footer.is_empty());
         (h, f)
     }
 
-    fn page_layout(&self) -> String {
-        let p = &self.doc.page;
-        let (has_h, has_f) = self.has_hf();
+    fn page_layout(&self, name: &str, p: &PageSetup, hf: &HeadersFooters) -> String {
+        let (has_h, has_f) = Self::has_hf(p, hf);
         let top = if has_h { p.header_distance } else { p.margin_top };
         let bottom = if has_f { p.footer_distance } else { p.margin_bottom };
         let mut s = format!(
-            r#"<style:page-layout style:name="pm1"><style:page-layout-properties fo:page-width="{}" fo:page-height="{}" style:print-orientation="{}" fo:margin-top="{}" fo:margin-bottom="{}" fo:margin-left="{}" fo:margin-right="{}""#,
+            r#"<style:page-layout style:name="{}"><style:page-layout-properties fo:page-width="{}" fo:page-height="{}" style:print-orientation="{}" fo:margin-top="{}" fo:margin-bottom="{}" fo:margin-left="{}" fo:margin-right="{}""#,
+            name,
             pt(p.width),
             pt(p.height),
             if p.width > p.height { "landscape" } else { "portrait" },
@@ -758,15 +878,14 @@ impl<'a> OdtWriter<'a> {
         s
     }
 
-    fn master_page(&mut self, auto: &mut AutoStyles) -> String {
-        let doc = self.doc;
-        let mut s = String::from(r#"<style:master-page style:name="Standard" style:page-layout-name="pm1">"#);
-        let (has_h, has_f) = self.has_hf();
+    fn master_page(&mut self, name: &str, layout: &str, page: &PageSetup, hf: &HeadersFooters, auto: &mut AutoStyles) -> String {
+        let mut s = format!(r#"<style:master-page style:name="{}" style:page-layout-name="{}">"#, esc_attr(name), layout);
+        let (has_h, has_f) = Self::has_hf(page, hf);
         let parts: [(&str, &Vec<Block>, bool); 4] = [
-            ("style:header", &doc.headers.header, true),
-            ("style:header-first", &doc.headers.first_header, doc.page.title_page),
-            ("style:footer", &doc.headers.footer, true),
-            ("style:footer-first", &doc.headers.first_footer, doc.page.title_page),
+            ("style:header", &hf.header, true),
+            ("style:header-first", &hf.first_header, page.title_page),
+            ("style:footer", &hf.footer, true),
+            ("style:footer-first", &hf.first_footer, page.title_page),
         ];
         for (tag, blocks, allowed) in parts {
             let is_header = tag.starts_with("style:header");
@@ -797,7 +916,40 @@ impl<'a> OdtWriter<'a> {
                 }
             }
         }
+        // Section boundaries apply to the document body only.
+        let top = body && std::ptr::eq(blocks.as_ptr(), self.doc.body.as_ptr());
+        let block_secs = if top { self.doc.block_sections() } else { Vec::new() };
+        let mut region_open = false;
         for (bi, b) in blocks.iter().enumerate() {
+            if top && (bi == 0 || block_secs[bi] != block_secs[bi - 1]) {
+                close_list(out, &mut list);
+                if region_open {
+                    out.push_str("</text:section>");
+                    region_open = false;
+                }
+                let si = block_secs[bi];
+                let page = self.doc.section_page(si);
+                match self.sec_modes.get(si).cloned().unwrap_or(SecMode::Region) {
+                    SecMode::Master(name) => {
+                        let pn = (page.page_number_start != 1).then_some(page.page_number_start);
+                        self.pending_master = Some((name, pn));
+                    }
+                    SecMode::Region => {
+                        self.region_id += 1;
+                        let st = auto.raw(
+                            "section",
+                            "Sect",
+                            format!(
+                                r#"<style:section-properties text:dont-balance-text-columns="false" style:editable="false"><style:columns fo:column-count="{}" fo:column-gap="{}"/></style:section-properties>"#,
+                                page.columns.max(1),
+                                pt(page.column_gap)
+                            ),
+                        );
+                        let _ = write!(out, r#"<text:section text:style-name="{}" text:name="Section{}">"#, st, self.region_id);
+                        region_open = true;
+                    }
+                }
+            }
             match b {
                 Block::Para(p) => {
                     let lref = p.props.list.flatten().filter(|l| self.list_styles.contains_key(&l.list));
@@ -832,7 +984,7 @@ impl<'a> OdtWriter<'a> {
                         }
                         None => close_list(out, &mut list),
                     }
-                    self.paragraph(out, p, auto, body, body && bi == 0);
+                    self.paragraph(out, p, auto, body);
                 }
                 Block::Table(t) => {
                     close_list(out, &mut list);
@@ -841,9 +993,13 @@ impl<'a> OdtWriter<'a> {
             }
         }
         close_list(out, &mut list);
+        if region_open {
+            out.push_str("</text:section>");
+        }
     }
 
-    fn paragraph(&mut self, out: &mut String, p: &Paragraph, auto: &mut AutoStyles, body: bool, first: bool) {
+    fn paragraph(&mut self, out: &mut String, p: &Paragraph, auto: &mut AutoStyles, body: bool) {
+        let master = self.pending_master.take();
         let style_id = p.props.style.clone().unwrap_or_else(|| "Normal".into());
         let parent = if self.doc.style(&style_id).is_some() { odf_name(&style_id) } else { "Standard".into() };
         let heading = resolve_para(self.doc, &p.props).outline_level;
@@ -851,8 +1007,8 @@ impl<'a> OdtWriter<'a> {
         direct.style = None;
         direct.list = None;
         let mut extra = String::new();
-        if first && self.doc.page.page_number_start != 1 {
-            let _ = write!(extra, r#" style:page-number="{}""#, self.doc.page.page_number_start);
+        if let Some((_, Some(n))) = &master {
+            let _ = write!(extra, r#" style:page-number="{}""#, n);
         }
         // Split the paragraph at page/column breaks.
         let mut segments: Vec<(Vec<&Run>, Option<&'static str>)> = vec![(Vec::new(), None)];
@@ -869,9 +1025,9 @@ impl<'a> OdtWriter<'a> {
             if let Some(b) = brk {
                 let _ = write!(ex, r#" fo:break-before="{}""#, b);
             }
-            let master = first && si == 0;
-            let has_direct = direct != ParaProps::default() || !ex.is_empty() || !mark.is_empty() || master;
-            let sname = if has_direct { auto.para(&parent, &direct, &mark, &ex, master) } else { parent.clone() };
+            let m = if si == 0 { master.as_ref().map(|(n, _)| n.as_str()) } else { None };
+            let has_direct = direct != ParaProps::default() || !ex.is_empty() || !mark.is_empty() || m.is_some();
+            let sname = if has_direct { auto.para(&parent, &direct, &mark, &ex, m) } else { parent.clone() };
             let (tag, lvl) = match heading {
                 Some(l) => ("text:h", format!(r#" text:outline-level="{}""#, l + 1)),
                 None => ("text:p", String::new()),
@@ -959,7 +1115,7 @@ impl<'a> OdtWriter<'a> {
             Inline::Tab => out.push_str("<text:tab/>"),
             Inline::LineBreak => out.push_str("<text:line-break/>"),
             Inline::PageBreak | Inline::ColumnBreak => {}
-            Inline::TextBox(_) => {}
+            Inline::TextBox(tb) => self.textbox(out, tb, auto),
             Inline::Bookmark(n) => {
                 let _ = write!(out, r#"<text:bookmark text:name="{}"/>"#, esc_attr(n));
             }
@@ -971,7 +1127,7 @@ impl<'a> OdtWriter<'a> {
                 }
                 Field::Other { result, .. } => text_xml(out, result),
             },
-            Inline::Image(img) => self.image(out, img),
+            Inline::Image(img) => self.image(out, img, auto),
             Inline::FootnoteRef(id) | Inline::EndnoteRef(id) => {
                 let foot = matches!(r.content, Inline::FootnoteRef(_));
                 let Some(&n) = self.note_ids.get(&(foot, *id)) else { return };
@@ -989,7 +1145,7 @@ impl<'a> OdtWriter<'a> {
                     if p.props.style.is_none() {
                         p.props.style = Some(style.into());
                     }
-                    self.paragraph(out, &p, auto, false, false);
+                    self.paragraph(out, &p, auto, false);
                 }
                 if note.paragraphs.is_empty() {
                     out.push_str("<text:p/>");
@@ -999,7 +1155,7 @@ impl<'a> OdtWriter<'a> {
         }
     }
 
-    fn image(&mut self, out: &mut String, img: &Image) {
+    fn image(&mut self, out: &mut String, img: &Image, auto: &mut AutoStyles) {
         let key = Arc::as_ptr(&img.data) as usize;
         let name = match self.pictures.get(&key) {
             Some(n) => n.clone(),
@@ -1011,18 +1167,68 @@ impl<'a> OdtWriter<'a> {
             }
         };
         self.frame_id += 1;
+        let (style, anchor) = match &img.float {
+            Some(f) => (frame_style(auto, f, ""), frame_anchor(f)),
+            None => ("Graphics".to_string(), r#"text:anchor-type="as-char""#.to_string()),
+        };
         let _ = write!(
             out,
-            r#"<draw:frame draw:style-name="Graphics" draw:name="Image{}" text:anchor-type="as-char" svg:width="{}" svg:height="{}" draw:z-index="0"><draw:image xlink:href="{}" xlink:type="simple" xlink:show="embed" xlink:actuate="onLoad"/>"#,
+            r#"<draw:frame draw:style-name="{}" draw:name="Image{}" {} svg:width="{}" svg:height="{}" draw:z-index="{}"><draw:image xlink:href="{}" xlink:type="simple" xlink:show="embed" xlink:actuate="onLoad"/>"#,
+            style,
             self.frame_id,
+            anchor,
             pt(img.width),
             pt(img.height),
+            z_index(img.float.as_ref(), self.frame_id),
             name
         );
         if !img.alt.is_empty() {
             let _ = write!(out, "<svg:desc>{}</svg:desc>", esc(&img.alt));
         }
         out.push_str("</draw:frame>");
+    }
+
+    fn textbox(&mut self, out: &mut String, tb: &TextBox, auto: &mut AutoStyles) {
+        self.frame_id += 1;
+        let mut extra = String::new();
+        match tb.fill {
+            Some(c) => {
+                let _ = write!(extra, r#" draw:fill="solid" draw:fill-color="{0}" fo:background-color="{0}""#, color_hex(c));
+            }
+            None => extra.push_str(r#" draw:fill="none" fo:background-color="transparent" style:background-transparency="100%""#),
+        }
+        let _ = write!(extra, r#" fo:border="{}" fo:padding="{}""#, border_str(&tb.border), pt(tb.padding));
+        if tb.auto_height {
+            extra.push_str(r#" draw:auto-grow-height="true""#);
+        }
+        let float = tb.float.unwrap_or(Float { wrap: WrapMode::Square, ..Default::default() });
+        let style = if tb.float.is_some() {
+            frame_style(auto, &float, &extra)
+        } else {
+            auto.get("graphic", "fr", format!("inline|{extra}"), |name| {
+                format!(
+                    r#"<style:style style:name="{}" style:family="graphic" style:parent-style-name="Frame"><style:graphic-properties style:vertical-pos="top" style:vertical-rel="baseline"{}/></style:style>"#,
+                    name, extra
+                )
+            })
+        };
+        let anchor = if tb.float.is_some() { frame_anchor(&float) } else { r#"text:anchor-type="as-char""#.to_string() };
+        let height = if tb.auto_height { format!(r#"fo:min-height="{}""#, pt(tb.height)) } else { format!(r#"svg:height="{}""#, pt(tb.height)) };
+        let _ = write!(
+            out,
+            r#"<draw:frame draw:style-name="{}" draw:name="Text Frame {}" {} svg:width="{}" {} draw:z-index="{}"><draw:text-box>"#,
+            style,
+            self.frame_id,
+            anchor,
+            pt(tb.width),
+            height,
+            z_index(tb.float.as_ref(), self.frame_id)
+        );
+        let paras: Vec<Paragraph> = if tb.paragraphs.is_empty() { vec![Paragraph::new()] } else { tb.paragraphs.clone() };
+        for p in &paras {
+            self.paragraph(out, p, auto, false);
+        }
+        out.push_str("</draw:text-box></draw:frame>");
     }
 
     fn table(&mut self, out: &mut String, t: &Table, auto: &mut AutoStyles, body: bool) {
@@ -1037,16 +1243,18 @@ impl<'a> OdtWriter<'a> {
             Align::Right => "right",
             _ => "left",
         };
-        let tstyle = auto.raw(
-            "table",
-            "Tbl",
-            format!(
-                r#"<style:table-properties style:width="{}" table:align="{}" fo:margin-left="{}" table:border-model="collapsing"/>"#,
-                pt(width),
-                align,
-                pt(t.indent)
-            ),
+        let props = format!(
+            r#"<style:table-properties style:width="{}" table:align="{}" fo:margin-left="{}" table:border-model="collapsing"/>"#,
+            pt(width),
+            align,
+            pt(t.indent)
         );
+        let tstyle = match self.pending_master.take() {
+            Some((m, _)) => auto.get("table", "Tbl", format!("{m}|{props}"), |name| {
+                format!(r#"<style:style style:name="{}" style:family="table" style:master-page-name="{}">{}</style:style>"#, name, esc_attr(&m), props)
+            }),
+            None => auto.raw("table", "Tbl", props),
+        };
         let _ = write!(out, r#"<table:table table:name="{}" table:style-name="{}">"#, tname, tstyle);
         for c in &cols {
             let cs = auto.raw("table-column", "Col", format!(r#"<style:table-column-properties style:column-width="{}"/>"#, pt(*c)));
@@ -1230,6 +1438,23 @@ struct OdfStyle {
     padding_left: Option<f32>,
     break_column: bool,
     page_number: Option<u32>,
+    /// `style:master-page-name` (paragraph and table styles).
+    master: Option<String>,
+    /// `style:graphic-properties` of a graphic style.
+    graphic: Option<Element>,
+    /// Column count and gap of a section style.
+    section_cols: Option<(u32, f32)>,
+}
+
+/// A section boundary found while reading the body.
+#[derive(Clone, Debug)]
+enum Bound {
+    /// A paragraph or table switches to this master page (optional new page number).
+    Master(String, Option<u32>),
+    /// A `text:section` with its own columns starts.
+    Region(u32, f32),
+    /// Text after a `text:section` continues in the master page's columns.
+    EndRegion,
 }
 
 struct OdtReader<'a> {
@@ -1244,7 +1469,13 @@ struct OdtReader<'a> {
     font_faces: HashMap<String, String>,
     images: HashMap<String, Arc<ImageData>>,
     comments_active: Vec<(String, u32)>,
-    pending: Vec<Paragraph>,
+    /// Nesting below the body (tables, notes, frames, headers): section breaks count at depth 0 only.
+    nest: u32,
+    bounds: Vec<(usize, Bound)>,
+    /// Page setup and headers of every master page.
+    masters: HashMap<String, (PageSetup, HeadersFooters)>,
+    /// Frames anchored outside paragraphs (to the page), attached to the next paragraph.
+    page_frames: Vec<Run>,
 }
 
 /// Read an .odt package.
@@ -1269,7 +1500,10 @@ pub fn read(bytes: &[u8]) -> Result<Document, String> {
         font_faces: HashMap::new(),
         images: HashMap::new(),
         comments_active: Vec::new(),
-        pending: Vec::new(),
+        nest: 1,
+        bounds: Vec::new(),
+        masters: HashMap::new(),
+        page_frames: Vec::new(),
     };
     let mut tabs_relative = true;
     if let Some(settings) = pkg.get("settings.xml").and_then(|b| xml::parse_bytes(b).ok()) {
@@ -1310,11 +1544,17 @@ pub fn read(bytes: &[u8]) -> Result<Document, String> {
     }
     let text = content.child("office:body").and_then(|b| b.child("office:text")).ok_or("content.xml has no office:text body")?;
     let mut blocks = Vec::new();
+    r.nest = 0;
     r.blocks(text, &mut blocks, None);
+    r.nest = 1;
+    if !r.page_frames.is_empty() {
+        blocks.push(Block::Para(Paragraph { runs: std::mem::take(&mut r.page_frames), ..Default::default() }));
+    }
     if blocks.is_empty() {
         blocks.push(Block::Para(Paragraph::new()));
     }
     r.doc.body = blocks;
+    r.apply_sections();
     if tabs_relative {
         r.absolutise_tabs();
     }
@@ -1403,6 +1643,12 @@ impl<'a> OdtReader<'a> {
             st.para = para_props(pp);
             st.break_column = pp.attr("fo:break-before") == Some("column");
             st.page_number = pp.attr("style:page-number").and_then(|v| v.parse().ok());
+        }
+        st.master = s.attr("style:master-page-name").filter(|m| !m.is_empty()).map(|m| m.to_string());
+        st.graphic = s.child("style:graphic-properties").cloned();
+        if let Some(c) = s.child("style:section-properties").and_then(|p| p.child("style:columns")) {
+            let n = c.attr("fo:column-count").and_then(|v| v.parse::<u32>().ok()).unwrap_or(1).max(1);
+            st.section_cols = Some((n, attr_len(c, "fo:column-gap").unwrap_or(0.0)));
         }
         st.para.outline_level = s.attr("style:default-outline-level").and_then(|v| v.parse::<u8>().ok()).filter(|v| *v >= 1).map(|v| v - 1);
         if let Some(tp) = s.child("style:table-properties") {
@@ -1648,14 +1894,24 @@ impl<'a> OdtReader<'a> {
 
     fn read_master(&mut self, styles_root: &Element) {
         let Some(ms) = styles_root.child("office:master-styles") else { return };
-        let master = ms
-            .children_named("style:master-page")
-            .find(|m| m.attr("style:name") == Some("Standard"))
-            .or_else(|| ms.child("style:master-page"));
-        let Some(master) = master else { return };
+        let masters: Vec<Element> = ms.children_named("style:master-page").cloned().collect();
+        for m in &masters {
+            let Some(name) = m.attr("style:name") else { continue };
+            let setup = self.master_setup(m);
+            self.masters.insert(name.to_string(), setup);
+        }
+        // The default page style: "Standard", else the first master page.
+        let default = masters.iter().find(|m| m.attr("style:name") == Some("Standard")).or(masters.first()).and_then(|m| m.attr("style:name"));
+        if let Some((page, hf)) = default.and_then(|d| self.masters.get(d)).cloned() {
+            self.doc.page = page;
+            self.doc.headers = hf;
+        }
+    }
+
+    fn master_setup(&mut self, master: &Element) -> (PageSetup, HeadersFooters) {
+        let mut page = PageSetup::default();
         let layout_name = master.attr("style:page-layout-name").unwrap_or("");
         if let Some(layout) = self.layouts.get(layout_name).cloned() {
-            let page = &mut self.doc.page;
             if let Some(pp) = layout.child("style:page-layout-properties") {
                 page.width = attr_len(pp, "fo:page-width").unwrap_or(page.width);
                 page.height = attr_len(pp, "fo:page-height").unwrap_or(page.height);
@@ -1693,6 +1949,7 @@ impl<'a> OdtReader<'a> {
                 page.margin_bottom += x;
             }
         }
+        let mut hf = HeadersFooters::default();
         for (tag, slot) in [("style:header", 0), ("style:footer", 1), ("style:header-first", 2), ("style:footer-first", 3)] {
             if let Some(h) = master.child(tag) {
                 if h.attr("style:display") == Some("false") {
@@ -1700,7 +1957,6 @@ impl<'a> OdtReader<'a> {
                 }
                 let mut blocks = Vec::new();
                 self.blocks(h, &mut blocks, None);
-                let hf = &mut self.doc.headers;
                 match slot {
                     0 => hf.header = blocks,
                     1 => hf.footer = blocks,
@@ -1708,10 +1964,95 @@ impl<'a> OdtReader<'a> {
                     _ => hf.first_footer = blocks,
                 }
                 if slot >= 2 {
-                    self.doc.page.title_page = true;
+                    page.title_page = true;
                 }
             }
         }
+        // Without a first-page header of its own, a page style shows its normal header on the first page.
+        if page.title_page {
+            if master.child("style:header-first").is_none() {
+                hf.first_header = hf.header.clone();
+            }
+            if master.child("style:footer-first").is_none() {
+                hf.first_footer = hf.footer.clone();
+            }
+        }
+        (page, hf)
+    }
+
+    /// Turn the section boundaries found in the body into `Paragraph::section` marks.
+    fn apply_sections(&mut self) {
+        let bounds = std::mem::take(&mut self.bounds);
+        let default_master = if self.masters.contains_key("Standard") { "Standard".to_string() } else { self.masters.keys().min().cloned().unwrap_or_default() };
+        let fallback = (self.doc.page.clone(), self.doc.headers.clone());
+        let mut cur_master = default_master.clone();
+        let setup = |name: &str| self.masters.get(name).cloned().unwrap_or_else(|| fallback.clone());
+        let mut secs: Vec<(usize, PageSetup, HeadersFooters)> = Vec::new();
+        let (p0, h0) = setup(&cur_master);
+        secs.push((0, p0, h0));
+        for (idx, b) in bounds {
+            let (page, hf) = match b {
+                Bound::Master(name, pn) => {
+                    cur_master = if self.masters.contains_key(&name) { name } else { cur_master };
+                    let (mut p, h) = setup(&cur_master);
+                    p.start = if cur_master.starts_with("RW_Continuous") {
+                        SectionStart::Continuous
+                    } else if cur_master.starts_with("RW_OddPage") {
+                        SectionStart::OddPage
+                    } else if cur_master.starts_with("RW_EvenPage") {
+                        SectionStart::EvenPage
+                    } else {
+                        SectionStart::NextPage
+                    };
+                    p.page_number_start = pn.unwrap_or(1).max(1);
+                    (p, h)
+                }
+                Bound::Region(n, gap) => {
+                    let (mut p, h) = setup(&cur_master);
+                    p.columns = n;
+                    p.column_gap = gap;
+                    p.start = SectionStart::Continuous;
+                    (p, h)
+                }
+                Bound::EndRegion => {
+                    let (mut p, h) = setup(&cur_master);
+                    p.start = SectionStart::Continuous;
+                    (p, h)
+                }
+            };
+            match secs.last_mut() {
+                Some(last) if last.0 == idx => {
+                    // A boundary at the very start of the body only sets up the first section.
+                    let start = if idx == 0 { last.1.start } else { page.start };
+                    *last = (idx, PageSetup { start, ..page }, hf);
+                }
+                _ if idx >= self.doc.body.len() => {}
+                _ => secs.push((idx, page, hf)),
+            }
+        }
+        // Each boundary ends the previous section at the block before it (a paragraph is added after a
+        // table that ends a section).
+        let (last_page, last_hf) = {
+            let l = secs.last().unwrap();
+            (l.1.clone(), l.2.clone())
+        };
+        let mut decided: Vec<Option<HeadersFooters>> = Vec::new();
+        let mut marks: Vec<(usize, Section)> = Vec::new();
+        for w in secs.windows(2) {
+            let (_, page, hf) = &w[0];
+            let resolved = decided.iter().rev().find_map(|h| h.as_ref()).unwrap_or(&last_hf);
+            let headers = if resolved != hf { Some(hf.clone()) } else { None };
+            decided.push(headers.clone());
+            marks.push((w[1].0 - 1, Section { page: page.clone(), headers }));
+        }
+        for (idx, sec) in marks.into_iter().rev() {
+            match &mut self.doc.body[idx] {
+                Block::Para(p) if p.section.is_none() => p.section = Some(Box::new(sec)),
+                _ => self.doc.body.insert(idx + 1, Block::Para(Paragraph { section: Some(Box::new(sec)), ..Default::default() })),
+            }
+        }
+        self.doc.page = last_page;
+        self.doc.headers = last_hf;
     }
 
     /// Resolve a paragraph style name: (model style id, direct props, paragraph-level char props, list style, style).
@@ -1734,10 +2075,36 @@ impl<'a> OdtReader<'a> {
         for c in el.elems() {
             match c.name.as_str() {
                 "text:p" | "text:h" => {
-                    let p = self.paragraph(c, list.clone());
+                    if self.nest == 0 {
+                        let st = c.attr("text:style-name").and_then(|n| self.styles.get(n));
+                        if let Some(m) = st.and_then(|s| s.master.clone()) {
+                            let pn = st.and_then(|s| s.page_number);
+                            self.bounds.push((out.len(), Bound::Master(m, pn)));
+                        }
+                    }
+                    let mut p = self.paragraph(c, list.clone());
+                    if self.nest == 0 && !self.page_frames.is_empty() {
+                        let mut runs = std::mem::take(&mut self.page_frames);
+                        runs.append(&mut p.runs);
+                        p.runs = runs;
+                    }
                     out.push(Block::Para(p));
-                    for p in self.pending.drain(..) {
-                        out.push(Block::Para(p));
+                }
+                "draw:frame" | "draw:a" | "draw:custom-shape" | "draw:rect" | "draw:g" if self.nest == 0 => {
+                    // Page-anchored objects sit outside paragraphs.
+                    let mut runs = Vec::new();
+                    let mut ws = WsState { at_start: true, prev_space: false };
+                    self.inline_elem(c, &CharProps::default(), &mut runs, &mut ws);
+                    self.page_frames.extend(runs);
+                }
+                "text:section" if self.nest == 0 => {
+                    let cols = c.attr("text:style-name").and_then(|n| self.styles.get(n)).and_then(|s| s.section_cols);
+                    if let Some((n, gap)) = cols {
+                        self.bounds.push((out.len(), Bound::Region(n, gap)));
+                    }
+                    self.blocks(c, out, list.clone());
+                    if cols.is_some() {
+                        self.bounds.push((out.len(), Bound::EndRegion));
                     }
                 }
                 "text:list" => {
@@ -1755,7 +2122,14 @@ impl<'a> OdtReader<'a> {
                     }
                 }
                 "table:table" => {
+                    if self.nest == 0 {
+                        if let Some(m) = c.attr("table:style-name").and_then(|n| self.styles.get(n)).and_then(|s| s.master.clone()) {
+                            self.bounds.push((out.len(), Bound::Master(m, None)));
+                        }
+                    }
+                    self.nest += 1;
                     let t = self.table(c);
+                    self.nest -= 1;
                     out.push(Block::Table(t));
                 }
                 "text:section" | "text:index-body" | "text:table-of-content" | "text:alphabetical-index" | "text:illustration-index"
@@ -1767,11 +2141,6 @@ impl<'a> OdtReader<'a> {
 
     fn paragraph(&mut self, el: &Element, list: Option<(String, u8)>) -> Paragraph {
         let (mut style, direct, base, list_style, st) = self.para_style(el.attr("text:style-name"));
-        if let Some(n) = st.as_ref().and_then(|s| s.page_number) {
-            if self.doc.body.is_empty() {
-                self.doc.page.page_number_start = n;
-            }
-        }
         let mut p = Paragraph { props: direct, mark: base.clone(), ..Default::default() };
         if el.name == "text:h" {
             let lvl = el.attr("text:outline-level").and_then(|v| v.parse::<u8>().ok()).unwrap_or(1).clamp(1, 9);
@@ -1918,9 +2287,9 @@ impl<'a> OdtReader<'a> {
                 let foot = e.attr("text:note-class") != Some("endnote");
                 let mut blocks = Vec::new();
                 if let Some(b) = e.child("text:note-body") {
-                    let saved = std::mem::take(&mut self.pending);
+                    self.nest += 1;
                     self.blocks(b, &mut blocks, None);
-                    self.pending = saved;
+                    self.nest -= 1;
                 }
                 let id = self.doc.next_note_id();
                 let note = Note { id, paragraphs: paras_only(blocks) };
@@ -1936,7 +2305,9 @@ impl<'a> OdtReader<'a> {
             "office:annotation" => {
                 let id = self.doc.next_comment_id();
                 let mut blocks = Vec::new();
+                self.nest += 1;
                 self.blocks(e, &mut blocks, None);
+                self.nest -= 1;
                 let author = e.child("dc:creator").map(|c| c.text()).unwrap_or_default();
                 let date = e.child("dc:date").map(|c| c.text()).unwrap_or_default();
                 let date = if date.len() >= 19 { format!("{}Z", &date[..19]) } else { date };
@@ -1952,28 +2323,155 @@ impl<'a> OdtReader<'a> {
                 }
             }
             "draw:frame" => {
+                let float = self.frame_float(e);
                 if let Some(img) = e.child("draw:image") {
                     if let Some(data) = self.load_image(img) {
                         let (nw, nh) = natural_size(&data, 468.0);
                         let w = attr_len(e, "svg:width").unwrap_or(nw);
                         let h = attr_len(e, "svg:height").unwrap_or(nh);
                         let alt = e.child("svg:desc").or_else(|| e.child("svg:title")).map(|d| d.text()).unwrap_or_default();
-                        self.push(out, Inline::Image(Image { data, width: w, height: h, alt, float: None }), props);
+                        self.push(out, Inline::Image(Image { data, width: w, height: h, alt, float }), props);
                         solid(ws);
                     }
                 } else if let Some(tb) = e.child("draw:text-box") {
-                    let mut blocks = Vec::new();
-                    let saved = std::mem::take(&mut self.pending);
-                    self.blocks(tb, &mut blocks, None);
-                    let mut pend = saved;
-                    pend.extend(paras_only(blocks));
-                    self.pending = pend;
+                    let tb = self.text_box(e, tb, float);
+                    self.push(out, Inline::TextBox(Box::new(tb)), props);
+                    solid(ws);
+                }
+            }
+            "draw:custom-shape" | "draw:rect" => {
+                // Shapes with text (LibreOffice's import of Word text boxes) become text boxes.
+                if e.child("text:p").is_some() || e.child("text:list").is_some() {
+                    let float = self.frame_float(e);
+                    let tb = self.text_box(e, e, float);
+                    self.push(out, Inline::TextBox(Box::new(tb)), props);
+                    solid(ws);
+                }
+            }
+            "draw:g" => {
+                for c in e.elems() {
+                    self.inline_elem(c, props, out, ws);
                 }
             }
             "text:soft-page-break" | "text:bookmark-end" | "text:reference-mark-end" | "text:change" | "text:change-start"
             | "text:change-end" | "text:toc-mark" | "text:alphabetical-index-mark" | "office:annotation-end-x" => {}
             _ => self.inline(e, props, out, ws),
         }
+    }
+
+    /// A graphic-properties attribute of a frame: on its automatic style, else up the parent chain.
+    fn graphic_attr(&self, style: Option<&str>, attr: &str) -> Option<String> {
+        let mut cur = style.map(|s| s.to_string());
+        let mut n = 0;
+        while let Some(name) = cur {
+            let st = self.styles.get(&name)?;
+            if let Some(v) = st.graphic.as_ref().and_then(|g| g.attr(attr)) {
+                return Some(v.to_string());
+            }
+            cur = st.parent.clone();
+            n += 1;
+            if n > 8 {
+                break;
+            }
+        }
+        None
+    }
+
+    /// Floating placement of a `draw:frame` (None when anchored as a character).
+    fn frame_float(&self, e: &Element) -> Option<Float> {
+        let style = e.attr("draw:style-name");
+        let g = |a: &str| self.graphic_attr(style, a);
+        let anchor = e.attr("text:anchor-type").map(|s| s.to_string()).or_else(|| g("text:anchor-type")).unwrap_or_else(|| "paragraph".into());
+        if anchor == "as-char" {
+            return None;
+        }
+        let mut f = Float::default();
+        let page = anchor == "page";
+        f.h_rel = match g("style:horizontal-rel").as_deref() {
+            Some("page" | "page-start-margin" | "page-end-margin") => HRel::Page,
+            Some("page-content") => HRel::Margin,
+            Some("char") => HRel::Character,
+            Some(_) => HRel::Column,
+            None if page => HRel::Page,
+            None => HRel::Column,
+        };
+        f.v_rel = match g("style:vertical-rel").as_deref() {
+            Some("page") => VRel::Page,
+            Some("page-content") => VRel::Margin,
+            Some("line" | "char" | "text" | "baseline") => VRel::Line,
+            Some(_) => VRel::Paragraph,
+            None if page => VRel::Page,
+            None => VRel::Paragraph,
+        };
+        f.h_align = match g("style:horizontal-pos").as_deref() {
+            Some("left" | "inside") => Some(FloatAlign::Start),
+            Some("center") => Some(FloatAlign::Center),
+            Some("right" | "outside") => Some(FloatAlign::End),
+            _ => None,
+        };
+        f.v_align = match g("style:vertical-pos").as_deref() {
+            Some("top") => Some(FloatAlign::Start),
+            Some("middle" | "center") => Some(FloatAlign::Center),
+            Some("bottom") => Some(FloatAlign::End),
+            _ => None,
+        };
+        f.x = attr_len(e, "svg:x").unwrap_or(0.0);
+        f.y = attr_len(e, "svg:y").unwrap_or(0.0);
+        f.wrap = match g("style:wrap").as_deref() {
+            Some("none") => WrapMode::TopBottom,
+            Some("run-through") => {
+                if g("style:run-through").as_deref() == Some("background") {
+                    WrapMode::Behind
+                } else {
+                    WrapMode::InFront
+                }
+            }
+            _ if g("style:wrap-contour").as_deref() == Some("true") => WrapMode::Tight,
+            _ => WrapMode::Square,
+        };
+        let margin = |side: &str| g(&format!("fo:margin-{side}")).or_else(|| g("fo:margin")).and_then(|v| parse_length(&v));
+        f.dist = ["left", "right", "top", "bottom"].iter().filter_map(|s| margin(s)).fold(0.0, f32::max);
+        Some(f)
+    }
+
+    /// A text box from a frame (`content`: its `draw:text-box`, or the shape itself).
+    fn text_box(&mut self, frame: &Element, content: &Element, float: Option<Float>) -> TextBox {
+        let style = frame.attr("draw:style-name");
+        let mut blocks = Vec::new();
+        self.nest += 1;
+        self.blocks(content, &mut blocks, None);
+        self.nest -= 1;
+        let mut paragraphs = paras_only(blocks);
+        if paragraphs.is_empty() {
+            paragraphs.push(Paragraph::new());
+        }
+        let g = |a: &str| self.graphic_attr(style, a);
+        let fill = match g("draw:fill").as_deref() {
+            Some("none") => None,
+            Some(_) => g("draw:fill-color").and_then(|c| css_color(&c)).or_else(|| g("fo:background-color").and_then(|c| css_color(&c))),
+            None => g("fo:background-color").filter(|c| c != "transparent").and_then(|c| css_color(&c)),
+        };
+        let border = match g("fo:border").or_else(|| g("fo:border-left")) {
+            Some(b) => parse_border_str(&b),
+            // Shapes draw an outline unless the stroke is turned off.
+            None if frame.name != "draw:frame" => match g("draw:stroke").as_deref() {
+                Some("none") => None,
+                _ => Some(Border {
+                    style: BorderStyle::Single,
+                    width: g("svg:stroke-width").and_then(|w| parse_length(&w)).filter(|w| *w > 0.0).unwrap_or(0.75),
+                    color: g("svg:stroke-color").and_then(|c| css_color(&c)).unwrap_or(Color::BLACK),
+                    space: 0.0,
+                }),
+            },
+            None => None,
+        };
+        let padding = g("fo:padding").or_else(|| g("fo:padding-left")).and_then(|p| parse_length(&p)).unwrap_or(if frame.name == "draw:frame" { 0.0 } else { 7.2 });
+        let tb_el = frame.child("draw:text-box");
+        let min_h = attr_len(frame, "fo:min-height").or_else(|| tb_el.and_then(|t| attr_len(t, "fo:min-height")));
+        let height = attr_len(frame, "svg:height").or(min_h).unwrap_or(72.0);
+        let auto_height = (attr_len(frame, "svg:height").is_none() && min_h.is_some()) || g("draw:auto-grow-height").as_deref() == Some("true");
+        let width = attr_len(frame, "svg:width").or_else(|| tb_el.and_then(|t| attr_len(t, "fo:min-width"))).unwrap_or(144.0);
+        TextBox { paragraphs, width, height, float, fill, border, padding, auto_height }
     }
 
     fn push(&self, out: &mut Vec<Run>, content: Inline, props: &CharProps) {

@@ -235,3 +235,74 @@ fn odt_loads_in_libreoffice() {
     assert!(d2.plain_text().contains("Span two"));
     assert_eq!(find_run(&d2, "red").props.color, Some(Color::rgb(255, 0, 0)));
 }
+
+#[test]
+fn odt_roundtrip_sections_floats_textboxes() {
+    let doc = sections_doc();
+    let back = roundtrip(&doc);
+    check_sections_doc(&back, "odt");
+    assert!(back.sections()[1].headers.is_none());
+    check_sections_doc(&roundtrip(&back), "odt twice");
+    // A continuous section that only changes columns is a text:section, not a new page style.
+    let mut d = Document::from_text("one");
+    d.body[0].as_para_mut().unwrap().section = Some(Box::new(Section { page: PageSetup::default(), headers: None }));
+    d.body.push(Block::Para(Paragraph::with_text("two")));
+    d.page.columns = 3;
+    d.page.start = SectionStart::Continuous;
+    let bytes = odt::write(&d).unwrap();
+    let back = odt::read(&bytes).unwrap();
+    assert_eq!(back.sections().len(), 1);
+    assert_eq!(back.page.columns, 3);
+    assert_eq!(back.page.start, SectionStart::Continuous);
+    assert_eq!(back.sections()[0].page.columns, 1);
+}
+
+#[test]
+fn odt_sections_render_in_libreoffice() {
+    if !soffice_available() {
+        eprintln!("soffice not available; skipping");
+        return;
+    }
+    let dir = scratch_dir().join("odt_sections_lo");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("sections.odt");
+    std::fs::write(&path, odt::write(&sections_doc()).unwrap()).unwrap();
+    let pdf = soffice_convert(&path, "pdf", &dir.join("pdf")).expect("LibreOffice could not convert the odt");
+    pdf_to_png(&pdf, &dir.join("page"));
+    let sizes = pdf_page_sizes(&pdf);
+    assert!(sizes.len() >= 3, "{sizes:?}");
+    assert!((sizes[0].0 - 612.0).abs() < 1.0 && (sizes[0].1 - 792.0).abs() < 1.0, "{sizes:?}");
+    assert!((sizes[1].0 - 841.9).abs() < 1.5 && sizes[1].0 > sizes[1].1, "{sizes:?}");
+    if let Some(text) = pdf_text(&pdf) {
+        for needle in ["Box line one", "Box line two", "Header S1", "Footer S1", "Section two text", "Header S3", "Filler line 59"] {
+            assert!(text.contains(needle), "PDF lacks {needle:?}");
+        }
+    }
+    // LibreOffice's own ODT and DOCX of the same document.
+    for (to, ext) in [("odt", "odt"), ("docx:MS Word 2007 XML", "docx")] {
+        let out = soffice_convert(&path, to, &dir.join(format!("resaved_{ext}"))).expect("re-save");
+        let back = io::open(&out).unwrap();
+        let what = format!("LibreOffice {ext}");
+        assert_eq!(back.sections().len(), 2, "{what}");
+        assert!((back.sections()[0].page.width - 612.0).abs() < 1.0, "{what}");
+        assert!((back.sections()[1].page.width - 841.9).abs() < 1.0, "{what}");
+        let tb = body_paras(&back)
+            .iter()
+            .flat_map(|p| p.runs.iter())
+            .find_map(|r| if let Inline::TextBox(t) = &r.content { Some(t.as_ref().clone()) } else { None })
+            .unwrap_or_else(|| panic!("{what}: no text box"));
+        assert_eq!(tb.paragraphs.iter().map(|p| p.text()).collect::<Vec<_>>(), vec!["Box line one", "Box line two"], "{what}");
+        assert_eq!(tb.fill, Some(Color::rgb(0xFF, 0xF2, 0xCC)), "{what}");
+        assert!(tb.float.is_some(), "{what}");
+        let imgs: Vec<Image> = body_paras(&back).iter().flat_map(|p| p.runs.iter()).filter_map(|r| if let Inline::Image(i) = &r.content { Some(i.clone()) } else { None }).collect();
+        assert_eq!(imgs.len(), 2, "{what}");
+        let f = imgs[0].float.unwrap_or_else(|| panic!("{what}: picture not floating"));
+        assert_eq!(f.wrap, WrapMode::Square, "{what}");
+        assert!((f.x - 36.0).abs() < 1.0 && (f.y - 18.0).abs() < 1.0, "{what}: {f:?}");
+        assert_eq!(imgs[1].float.map(|f| f.wrap), Some(WrapMode::Behind), "{what}");
+        let t = |b: &[Block]| b.iter().filter_map(|b| b.as_para()).map(|p| p.text()).collect::<String>();
+        assert_eq!(t(&back.section_headers(0).header), "Header S1", "{what}");
+        assert_eq!(t(&back.section_headers(1).header), "Header S1", "{what}");
+    }
+}
