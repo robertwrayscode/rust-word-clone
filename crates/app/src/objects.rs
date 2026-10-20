@@ -174,6 +174,7 @@ impl App {
 
     /// Wrap Text: `None` = In Line with Text.
     pub fn set_wrap(&mut self, wrap: Option<WrapMode>) {
+        self.ensure_layout();
         let Some((pos, obj)) = self.selected_object() else { return };
         // Current position on the page, so the object doesn't jump.
         let page = self.layout.page_of(pos).unwrap_or(0);
@@ -237,9 +238,10 @@ impl App {
 
     /// Insert a floating text box near the caret and open it for editing.
     pub fn insert_text_box(&mut self) {
+        self.ensure_layout();
         let pos = self.sel.range().0;
         let page = self.layout.page_of(pos).unwrap_or(0);
-        let (x, y) = self.layout.caret_on_page(pos, page).map(|c| (c.x, c.top + 18.0)).unwrap_or((90.0, 90.0));
+        let (x, y) = self.layout.caret_on_page(pos, page).map(|c| (c.x.min(self.page_setup().width - 260.0).max(36.0), c.top + c.height + 12.0)).unwrap_or((90.0, 90.0));
         let mut tb = TextBox::default();
         tb.float = Some(Float { wrap: WrapMode::Square, h_rel: HRel::Page, v_rel: VRel::Page, x, y, ..Float::default() });
         tb.width = 180.0;

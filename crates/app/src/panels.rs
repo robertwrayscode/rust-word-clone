@@ -186,6 +186,41 @@ fn run_action(app: &mut App, a: &str) {
             app.export_pdf_to(PathBuf::from(arg));
         }
         "open" => app.open_path(PathBuf::from(arg)),
+        "sectionbreak" => app.insert_section_break(if arg == "continuous" { wordcore::SectionStart::Continuous } else { wordcore::SectionStart::NextPage }),
+        "landscape" => {
+            let mut s = app.page_setup();
+            if s.width < s.height {
+                std::mem::swap(&mut s.width, &mut s.height);
+            }
+            app.set_page_setup(s);
+        }
+        "textbox" => {
+            app.insert_text_box();
+            app.dialog = None;
+        }
+        "picture" => {
+            if let Ok(img) = crate::images::load_file(std::path::Path::new(arg)) {
+                app.insert_image(img, "Insert Picture");
+            }
+        }
+        "selectleft" => {
+            let h = app.sel.head;
+            let l = app.doc.left(h);
+            app.select(l, h);
+        }
+        "wrap" => app.set_wrap(match arg {
+            "square" => Some(wordcore::WrapMode::Square),
+            "topbottom" => Some(wordcore::WrapMode::TopBottom),
+            "behind" => Some(wordcore::WrapMode::Behind),
+            "front" => Some(wordcore::WrapMode::InFront),
+            _ => None,
+        }),
+        "move" => {
+            if let Some((p, _)) = app.selected_object() {
+                let (x, y) = arg.split_once(',').map(|(a, b)| (a.parse().unwrap_or(72.0), b.parse().unwrap_or(72.0))).unwrap_or((72.0, 72.0));
+                app.move_object(p, x, y);
+            }
+        }
         _ => eprintln!("unknown --action {}", a),
     }
     app.scroll_to_caret = true;
