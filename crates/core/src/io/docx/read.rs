@@ -186,12 +186,20 @@ struct Reader<'a> {
     comments_active: Vec<u32>,
     fields: Vec<FieldState>,
     images: HashMap<String, Arc<ImageData>>,
-    pending: Vec<Paragraph>,
-    sect_prs: Vec<Element>,
-    section_ends_pending: bool,
-    section_starts: Vec<usize>,
+    /// `w:pPr/w:sectPr` elements of section-ending body paragraphs, in document order.
+    para_sects: Vec<Element>,
+    /// The body-level `w:sectPr` (the last section).
+    body_sect: Option<Element>,
+    /// Nesting depth below the body (tables, text boxes): section breaks only count at depth 0.
+    nest: u32,
     strip_space: bool,
     saw_watermark: bool,
+    /// Watermark text found while reading a header part.
+    found_watermark: Option<String>,
+    /// Parsed header/footer parts by target: (blocks, watermark).
+    hf_cache: HashMap<String, (Vec<Block>, Option<String>)>,
+    /// Theme colour scheme (dk1, lt1, accent1, …) → colour.
+    theme_colors: HashMap<String, Color>,
     kind: Part,
 }
 
@@ -230,12 +238,14 @@ pub fn read(bytes: &[u8]) -> Result<Document, String> {
         comments_active: Vec::new(),
         fields: Vec::new(),
         images: HashMap::new(),
-        pending: Vec::new(),
-        sect_prs: Vec::new(),
-        section_ends_pending: false,
-        section_starts: Vec::new(),
+        para_sects: Vec::new(),
+        body_sect: None,
+        nest: 0,
         strip_space: false,
         saw_watermark: false,
+        found_watermark: None,
+        hf_cache: HashMap::new(),
+        theme_colors: HashMap::new(),
         kind: Part::Body,
     };
 
@@ -285,7 +295,30 @@ impl<'a> Reader<'a> {
     }
 
     fn read_theme(&mut self) {
+        for (k, v) in [
+            ("dk1", "000000"),
+            ("lt1", "FFFFFF"),
+            ("dk2", "44546A"),
+            ("lt2", "E7E6E6"),
+            ("accent1", "4472C4"),
+            ("accent2", "ED7D31"),
+            ("accent3", "A5A5A5"),
+            ("accent4", "FFC000"),
+            ("accent5", "5B9BD5"),
+            ("accent6", "70AD47"),
+            ("hlink", "0563C1"),
+            ("folHlink", "954F72"),
+        ] {
+            self.theme_colors.insert(k.to_string(), Color::from_hex(v).unwrap_or_default());
+        }
         let Some((_, root)) = self.part_xml("/theme") else { return };
+        if let Some(cs) = root.find("a:clrScheme") {
+            for c in cs.elems() {
+                if let Some(col) = c.elems().find_map(|x| x.attr("val").filter(|_| x.local() == "srgbClr").or_else(|| x.attr("lastClr"))).and_then(Color::from_hex) {
+                    self.theme_colors.insert(c.local().to_string(), col);
+                }
+            }
+        }
         if let Some(f) = root.find("a:majorFont").and_then(|m| m.child("a:latin")).and_then(|l| l.attr("typeface")) {
             if !f.is_empty() {
                 self.major_font = f.to_string();
@@ -587,22 +620,104 @@ impl<'a> Reader<'a> {
     }
 
     fn apply_sections(&mut self) {
-        let sects = std::mem::take(&mut self.sect_prs);
-        // Section breaks: the type of the *following* section says how it starts.
-        for (k, &idx) in self.section_starts.iter().enumerate() {
-            let ty = sects.get(k + 1).and_then(|s| s.child_attr("w:type", "w:val")).unwrap_or("nextPage");
-            if ty != "continuous" {
-                if let Some(Block::Para(p)) = self.doc.body.get_mut(idx) {
-                    p.props.page_break_before = Some(true);
+        let para_sects = std::mem::take(&mut self.para_sects);
+        let body_sect = self.body_sect.take();
+        let bg = self.doc.page.page_color;
+        let all: Vec<Option<&Element>> = para_sects.iter().map(Some).chain(std::iter::once(body_sect.as_ref())).collect();
+        const KINDS: [(&str, &str, HfKind); 4] = [
+            ("w:headerReference", "default", HfKind::Header),
+            ("w:footerReference", "default", HfKind::Footer),
+            ("w:headerReference", "first", HfKind::FirstHeader),
+            ("w:footerReference", "first", HfKind::FirstFooter),
+        ];
+        // Word semantics: a section without a reference of some kind inherits that kind from the previous section.
+        let mut eff: [Option<String>; 4] = Default::default();
+        let mut sections: Vec<(PageSetup, HeadersFooters, bool)> = Vec::new();
+        for s in &all {
+            let mut page = s.map(|s| self.parse_page(s)).unwrap_or_default();
+            page.page_color = bg;
+            let mut has_own = false;
+            if let Some(s) = s {
+                for (k, (tag, ty, _)) in KINDS.iter().enumerate() {
+                    for r in s.children_named(tag) {
+                        if r.attr("w:type").unwrap_or("default") != *ty {
+                            continue;
+                        }
+                        if let Some(rel) = r.attr("r:id").and_then(|id| self.rels.map.get(id)) {
+                            eff[k] = Some(rel.target.clone());
+                            has_own = true;
+                        }
+                    }
+                }
+            }
+            let mut hf = HeadersFooters::default();
+            let mut wm = None;
+            for (k, (_, _, kind)) in KINDS.iter().enumerate() {
+                if let Some(t) = eff[k].clone() {
+                    let (blocks, w) = self.header_part(&t);
+                    *hf.part_mut(*kind) = blocks;
+                    if matches!(kind, HfKind::Header | HfKind::FirstHeader) && wm.is_none() {
+                        wm = w;
+                    }
+                }
+            }
+            if wm.is_some() {
+                page.watermark = wm;
+            }
+            sections.push((page, hf, has_own));
+        }
+        let (last_page, last_hf, _) = sections.pop().unwrap_or_default();
+        // Earlier sections: keep their own headers when they had references or when the model's
+        // "linked to previous" resolution would display something else.
+        let mut decided: Vec<Option<HeadersFooters>> = Vec::new();
+        let mut out: Vec<Section> = Vec::new();
+        for (page, hf, has_own) in sections {
+            let resolved = decided.iter().rev().find_map(|h| h.as_ref()).unwrap_or(&last_hf);
+            let headers = if has_own || *resolved != hf { Some(hf) } else { None };
+            decided.push(headers.clone());
+            out.push(Section { page, headers });
+        }
+        let mut it = out.into_iter();
+        for b in self.doc.body.iter_mut() {
+            if let Block::Para(p) = b {
+                if p.section.is_some() {
+                    match it.next() {
+                        Some(s) => p.section = Some(Box::new(s)),
+                        None => p.section = None,
+                    }
                 }
             }
         }
-        let Some(last) = sects.last() else { return };
-        let page = &mut self.doc.page;
-        if let Some(sz) = last.child("w:pgSz") {
-            let w = tw(sz, "w:w");
-            let h = tw(sz, "w:h");
-            if let (Some(w), Some(h)) = (w, h) {
+        self.doc.page = last_page;
+        self.doc.headers = last_hf;
+    }
+
+    /// Read (once) a header/footer part: its blocks and any watermark it carries.
+    fn header_part(&mut self, target: &str) -> (Vec<Block>, Option<String>) {
+        if let Some(c) = self.hf_cache.get(target) {
+            return c.clone();
+        }
+        let res = match self.pkg.get(target).and_then(|b| xml::parse_bytes(b).ok()) {
+            Some(root) => {
+                self.found_watermark = None;
+                let blocks = self.with_part(target, Part::Header, |r| {
+                    let mut b = Vec::new();
+                    r.blocks(&root, &mut b);
+                    b
+                });
+                (blocks, self.found_watermark.take())
+            }
+            None => (Vec::new(), None),
+        };
+        self.hf_cache.insert(target.to_string(), res.clone());
+        res
+    }
+
+    /// Page setup of one `w:sectPr`.
+    fn parse_page(&self, sect: &Element) -> PageSetup {
+        let mut page = PageSetup::default();
+        if let Some(sz) = sect.child("w:pgSz") {
+            if let (Some(w), Some(h)) = (tw(sz, "w:w"), tw(sz, "w:h")) {
                 page.width = w;
                 page.height = h;
                 let landscape = sz.attr("w:orient") == Some("landscape");
@@ -611,7 +726,7 @@ impl<'a> Reader<'a> {
                 }
             }
         }
-        if let Some(m) = last.child("w:pgMar") {
+        if let Some(m) = sect.child("w:pgMar") {
             if let Some(v) = tw(m, "w:top") {
                 page.margin_top = v.abs();
             }
@@ -632,53 +747,29 @@ impl<'a> Reader<'a> {
                 page.footer_distance = v;
             }
         }
-        if let Some(c) = last.child("w:cols") {
+        if let Some(c) = sect.child("w:cols") {
             page.columns = num_attr(c, "w:num").map(|n| n.max(1.0) as u32).unwrap_or(1);
             if let Some(s) = tw(c, "w:space") {
                 page.column_gap = s;
             }
         }
-        page.title_page = last.child("w:titlePg").map(on).unwrap_or(false);
-        if let Some(s) = last.child("w:pgNumType").and_then(|p| num_attr(p, "w:start")) {
+        page.title_page = sect.child("w:titlePg").map(on).unwrap_or(false);
+        if let Some(s) = sect.child("w:pgNumType").and_then(|p| num_attr(p, "w:start")) {
             page.page_number_start = s.max(0.0) as u32;
         }
-        if let Some(b) = last.child("w:pgBorders") {
+        if let Some(b) = sect.child("w:pgBorders") {
             let borders = parse_borders(b);
             if !borders.is_empty() {
                 page.page_borders = Some(borders);
             }
         }
-        // Headers / footers: later sections override earlier ones, per type.
-        let mut refs: HashMap<(bool, String), String> = HashMap::new();
-        for s in &sects {
-            for (tag, is_header) in [("w:headerReference", true), ("w:footerReference", false)] {
-                for r in s.children_named(tag) {
-                    if let (Some(t), Some(id)) = (r.attr("w:type").or(Some("default")), r.attr("r:id")) {
-                        if let Some(rel) = self.rels.map.get(id) {
-                            refs.insert((is_header, t.to_string()), rel.target.clone());
-                        }
-                    }
-                }
-            }
-        }
-        for ((is_header, t), target) in refs {
-            let Some(bytes) = self.pkg.get(&target) else { continue };
-            let Ok(root) = xml::parse_bytes(bytes) else { continue };
-            let blocks = self.with_part(&target, Part::Header, |r| {
-                let mut b = Vec::new();
-                r.blocks(&root, &mut b);
-                b
-            });
-            let h = &mut self.doc.headers;
-            let slot = match (is_header, t.as_str()) {
-                (true, "default") => &mut h.header,
-                (true, "first") => &mut h.first_header,
-                (false, "default") => &mut h.footer,
-                (false, "first") => &mut h.first_footer,
-                _ => continue,
-            };
-            *slot = blocks;
-        }
+        page.start = match sect.child_attr("w:type", "w:val") {
+            Some("continuous") => SectionStart::Continuous,
+            Some("evenPage") => SectionStart::EvenPage,
+            Some("oddPage") => SectionStart::OddPage,
+            _ => SectionStart::NextPage,
+        };
+        page
     }
 
     // ----- block content -----
@@ -690,19 +781,11 @@ impl<'a> Reader<'a> {
                     self.saw_watermark = false;
                     let p = self.paragraph(c);
                     // A paragraph that only carried the watermark shape is dropped (the writer recreates it).
-                    if self.saw_watermark && p.runs.is_empty() {
+                    if self.saw_watermark && p.runs.is_empty() && p.section.is_none() {
                         self.saw_watermark = false;
                         continue;
                     }
                     out.push(Block::Para(p));
-                    if self.section_ends_pending {
-                        self.section_ends_pending = false;
-                        // The next block starts a new section.
-                        self.section_starts.push(out.len());
-                    }
-                    for x in self.pending.drain(..) {
-                        out.push(Block::Para(x));
-                    }
                 }
                 "w:tbl" => {
                     let t = self.table(c);
@@ -719,7 +802,7 @@ impl<'a> Reader<'a> {
                         self.blocks(ch, out);
                     }
                 }
-                "w:sectPr" if self.kind == Part::Body => self.sect_prs.push(c.clone()),
+                "w:sectPr" if self.kind == Part::Body && self.nest == 0 => self.body_sect = Some(c.clone()),
                 "w:commentRangeStart" => self.comment_start(c),
                 "w:commentRangeEnd" => self.comment_end(c),
                 _ => {}
@@ -749,9 +832,10 @@ impl<'a> Reader<'a> {
             p.props = props;
             p.mark = mark;
             if let Some(s) = ppr.child("w:sectPr") {
-                if self.kind == Part::Body {
-                    self.sect_prs.push(s.clone());
-                    self.section_ends_pending = true;
+                if self.kind == Part::Body && self.nest == 0 {
+                    // Filled in by `apply_sections` once all sections are known.
+                    self.para_sects.push(s.clone());
+                    p.section = Some(Box::default());
                 }
             }
         }
@@ -919,10 +1003,13 @@ impl<'a> Reader<'a> {
                     self.emit(Run { content: Inline::Text(text), props: p }, out);
                     continue;
                 }
-                "w:drawing" => match self.drawing(c) {
-                    Some(i) => i,
-                    None => continue,
-                },
+                "w:drawing" => {
+                    for i in self.drawing(c) {
+                        self.strip_space = false;
+                        self.emit(Run { content: i, props: props.clone() }, out);
+                    }
+                    continue;
+                }
                 "w:pict" | "w:object" => match self.vml(c) {
                     Some(i) => i,
                     None => continue,
@@ -1037,36 +1124,169 @@ impl<'a> Reader<'a> {
         Some(d)
     }
 
-    fn drawing(&mut self, d: &Element) -> Option<Inline> {
-        let cont = d.child("wp:inline").or_else(|| d.child("wp:anchor"))?;
+    fn drawing(&mut self, d: &Element) -> Vec<Inline> {
+        let Some(cont) = d.child("wp:inline").or_else(|| d.child("wp:anchor")) else { return Vec::new() };
+        let float = if cont.name == "wp:anchor" { Some(anchor_float(cont)) } else { None };
         let ext = cont.child("wp:extent");
-        let cx = ext.and_then(|e| num_attr(e, "cx")).unwrap_or(0.0) / 12700.0;
-        let cy = ext.and_then(|e| num_attr(e, "cy")).unwrap_or(0.0) / 12700.0;
+        let cx = ext.and_then(|e| num_attr(e, "cx")).unwrap_or(0.0) / EMU_PER_PT;
+        let cy = ext.and_then(|e| num_attr(e, "cy")).unwrap_or(0.0) / EMU_PER_PT;
         let doc_pr = cont.child("wp:docPr");
         let alt = doc_pr.and_then(|p| p.attr("descr").filter(|s| !s.is_empty()).or_else(|| p.attr("title"))).unwrap_or("").to_string();
+        let gd = cont.child("a:graphic").and_then(|g| g.child("a:graphicData"));
+        let mut out = Vec::new();
+        if let Some(gd) = gd {
+            if let Some(grp) = gd.child("wpg:wgp") {
+                self.group(grp, (0.0, 0.0, cx, cy), float, &mut out);
+                if !out.is_empty() {
+                    return out;
+                }
+            }
+            if let Some(wsp) = gd.child("wps:wsp") {
+                if let Some(tb) = self.wsp_textbox(wsp, cx, cy, float) {
+                    return vec![Inline::TextBox(Box::new(tb))];
+                }
+            }
+        }
         if let Some(blip) = cont.find("a:blip") {
             if let Some(id) = blip.attr("r:embed") {
                 if let Some(data) = self.load_image(id) {
                     let (w, h) = if cx > 0.0 && cy > 0.0 { (cx, cy) } else { natural_size(&data, 468.0) };
-                    return Some(Inline::Image(Image { data, width: w, height: h, alt, float: None }));
+                    out.push(Inline::Image(Image { data, width: w, height: h, alt, float }));
+                    return out;
                 }
             }
         }
         if let Some(tb) = cont.find("w:txbxContent") {
-            self.textbox(tb);
+            let paragraphs = self.textbox_paras(tb);
+            let tb = TextBox { paragraphs, width: cx.max(1.0), height: cy.max(1.0), float, fill: None, border: None, ..Default::default() };
+            out.push(Inline::TextBox(Box::new(tb)));
         }
-        None
+        out
     }
 
-    fn textbox(&mut self, tb: &Element) {
+    /// Pictures and text boxes of a shape group. `frame`: the group's placement (x, y, w, h) in points,
+    /// relative to the anchor position.
+    fn group(&mut self, grp: &Element, frame: (f32, f32, f32, f32), float: Option<Float>, out: &mut Vec<Inline>) {
+        let xf = grp.child("wpg:grpSpPr").and_then(|p| p.child("a:xfrm"));
+        let get = |n: &str, a: &str| xf.and_then(|x| x.child(n)).and_then(|e| num_attr(e, a));
+        let (chx, chy) = (get("a:chOff", "x").unwrap_or(0.0), get("a:chOff", "y").unwrap_or(0.0));
+        let chw = get("a:chExt", "cx").filter(|v| *v > 0.0);
+        let chh = get("a:chExt", "cy").filter(|v| *v > 0.0);
+        let sx = chw.map(|w| frame.2 / w).unwrap_or(1.0 / EMU_PER_PT);
+        let sy = chh.map(|h| frame.3 / h).unwrap_or(1.0 / EMU_PER_PT);
+        for c in grp.elems() {
+            let sppr = c.child("wps:spPr").or_else(|| c.child("pic:spPr")).or_else(|| c.child("wpg:grpSpPr"));
+            let cxf = sppr.and_then(|p| p.child("a:xfrm"));
+            let off = cxf.and_then(|x| x.child("a:off"));
+            let ext = cxf.and_then(|x| x.child("a:ext"));
+            let x = frame.0 + (off.and_then(|o| num_attr(o, "x")).unwrap_or(chx) - chx) * sx;
+            let y = frame.1 + (off.and_then(|o| num_attr(o, "y")).unwrap_or(chy) - chy) * sy;
+            let w = ext.and_then(|e| num_attr(e, "cx")).unwrap_or(0.0) * sx;
+            let h = ext.and_then(|e| num_attr(e, "cy")).unwrap_or(0.0) * sy;
+            let child_float = float.map(|mut f| {
+                if f.h_align.is_none() {
+                    f.x += x;
+                }
+                if f.v_align.is_none() {
+                    f.y += y;
+                }
+                f
+            });
+            match c.name.as_str() {
+                "wpg:grpSp" => self.group(c, (x, y, w, h), float, out),
+                "wps:wsp" => {
+                    if let Some(tb) = self.wsp_textbox(c, w, h, child_float) {
+                        out.push(Inline::TextBox(Box::new(tb)));
+                    }
+                }
+                "pic:pic" => {
+                    let Some(id) = c.find("a:blip").and_then(|b| b.attr("r:embed")) else { continue };
+                    let Some(data) = self.load_image(id) else { continue };
+                    let alt = c.find("pic:cNvPr").and_then(|p| p.attr("descr")).unwrap_or("").to_string();
+                    let (w, h) = if w > 0.0 && h > 0.0 { (w, h) } else { natural_size(&data, 468.0) };
+                    out.push(Inline::Image(Image { data, width: w, height: h, alt, float: child_float }));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// A `wps:wsp` shape with text → text box (shapes without text are skipped).
+    fn wsp_textbox(&mut self, wsp: &Element, w: f32, h: f32, float: Option<Float>) -> Option<TextBox> {
+        let content = wsp.child("wps:txbx").and_then(|t| t.child("w:txbxContent"))?;
+        let paragraphs = self.textbox_paras(content);
+        let sppr = wsp.child("wps:spPr");
+        let style = wsp.child("wps:style");
+        let style_ref = |name: &str| style.and_then(|s| s.child(name)).filter(|r| num_attr(r, "idx").unwrap_or(0.0) > 0.0);
+        let fill = match sppr.and_then(|p| p.elems().find(|e| matches!(e.name.as_str(), "a:noFill" | "a:solidFill" | "a:gradFill" | "a:pattFill"))) {
+            Some(f) if f.name == "a:noFill" => None,
+            Some(f) if f.name == "a:solidFill" => self.drawing_color(f),
+            Some(f) => f.find("a:gs").and_then(|g| self.drawing_color(g)).or_else(|| f.find("a:fgClr").and_then(|g| self.drawing_color(g))),
+            None => style_ref("a:fillRef").and_then(|r| self.drawing_color(r)),
+        };
+        let border = match sppr.and_then(|p| p.child("a:ln")) {
+            Some(ln) if ln.child("a:noFill").is_some() => None,
+            Some(ln) => {
+                let color = ln
+                    .child("a:solidFill")
+                    .and_then(|f| self.drawing_color(f))
+                    .or_else(|| style_ref("a:lnRef").and_then(|r| self.drawing_color(r)));
+                // A line without a fill of its own uses the style's line colour; no style line → none.
+                color.map(|color| Border { style: line_dash(ln), width: num_attr(ln, "w").map(|v| v / EMU_PER_PT).unwrap_or(0.75), color, space: 0.0 })
+            }
+            None => style_ref("a:lnRef").and_then(|r| self.drawing_color(r)).map(|color| Border { style: BorderStyle::Single, width: 0.75, color, space: 0.0 }),
+        };
+        let body = wsp.child("wps:bodyPr");
+        let padding = body.and_then(|b| num_attr(b, "lIns")).unwrap_or(91440.0) / EMU_PER_PT;
+        let auto_height = body.map(|b| b.child("a:spAutoFit").is_some()).unwrap_or(false);
+        Some(TextBox { paragraphs, width: w.max(1.0), height: h.max(1.0), float, fill, border, padding, auto_height })
+    }
+
+    /// Colour of a DrawingML fill/colour container (`a:srgbClr`, `a:schemeClr`, `a:prstClr`, `a:sysClr`).
+    fn drawing_color(&self, e: &Element) -> Option<Color> {
+        let c = e.elems().find(|c| matches!(c.name.as_str(), "a:srgbClr" | "a:schemeClr" | "a:prstClr" | "a:sysClr" | "a:scrgbClr"))?;
+        let base = match c.name.as_str() {
+            "a:srgbClr" => c.attr("val").and_then(Color::from_hex)?,
+            "a:sysClr" => c.attr("lastClr").and_then(Color::from_hex).unwrap_or(if c.attr("val") == Some("window") { Color::WHITE } else { Color::BLACK }),
+            "a:prstClr" => c.attr("val").and_then(named_color).unwrap_or(Color::BLACK),
+            "a:scrgbClr" => {
+                let ch = |a: &str| (num_attr(c, a).unwrap_or(0.0) / 100000.0 * 255.0).round().clamp(0.0, 255.0) as u8;
+                Color::rgb(ch("r"), ch("g"), ch("b"))
+            }
+            _ => {
+                let v = c.attr("val").unwrap_or("dk1");
+                let key = match v {
+                    "tx1" => "dk1",
+                    "bg1" => "lt1",
+                    "tx2" => "dk2",
+                    "bg2" => "lt2",
+                    "phClr" => "accent1",
+                    k => k,
+                };
+                self.theme_colors.get(key).copied().unwrap_or(Color::BLACK)
+            }
+        };
+        let m = |n: &str| c.child(n).and_then(|e| num_attr(e, "val")).map(|v| v / 100000.0);
+        Some(adjust_color(base, m("a:lumMod"), m("a:lumOff"), m("a:shade"), m("a:tint")))
+    }
+
+    fn textbox_paras(&mut self, tb: &Element) -> Vec<Paragraph> {
         let saved_fields = std::mem::take(&mut self.fields);
-        let saved_pending = std::mem::take(&mut self.pending);
+        let saved_strip = self.strip_space;
+        self.nest += 1;
         let mut blocks = Vec::new();
         self.blocks(tb, &mut blocks);
+        self.nest -= 1;
         self.fields = saved_fields;
-        let mut pending = saved_pending;
-        pending.extend(flatten_blocks(blocks));
-        self.pending = pending;
+        self.strip_space = saved_strip;
+        let mut paras = flatten_blocks(blocks);
+        for p in paras.iter_mut() {
+            p.section = None;
+        }
+        if paras.is_empty() {
+            paras.push(Paragraph::new());
+        }
+        paras
     }
 
     fn vml(&mut self, el: &Element) -> Option<Inline> {
@@ -1075,34 +1295,56 @@ impl<'a> Reader<'a> {
         if let Some(s) = tps.iter().find_map(|t| t.attr("string")) {
             if self.kind == Part::Header {
                 if !s.trim().is_empty() {
-                    self.doc.page.watermark = Some(s.to_string());
+                    self.found_watermark = Some(s.to_string());
                 }
                 self.saw_watermark = true;
                 return None;
             }
         }
+        let shape = el.elems().find(|e| e.name.starts_with("v:") && e.name != "v:shapetype").or_else(|| el.find("v:shape")).or_else(|| el.find("v:rect"));
+        let style = shape.and_then(|s| s.attr("style")).unwrap_or("");
+        let css = parse_vml_style(style);
+        let w = css.get("width").and_then(|v| parse_length(v));
+        let h = css.get("height").and_then(|v| parse_length(v));
+        let float = shape.and_then(|s| vml_float(s, &css));
         if let Some(img) = el.find("v:imagedata") {
             let id = img.attr("r:id").or_else(|| img.attr("r:pict"))?;
             let data = self.load_image(id)?;
-            let shape = el.find("v:shape").or_else(|| el.find("v:rect"));
-            let style = shape.and_then(|s| s.attr("style")).unwrap_or("");
-            let mut w = None;
-            let mut h = None;
-            for decl in style.split(';') {
-                if let Some((k, v)) = decl.split_once(':') {
-                    match k.trim() {
-                        "width" => w = parse_length(v),
-                        "height" => h = parse_length(v),
-                        _ => {}
-                    }
-                }
-            }
             let (nw, nh) = natural_size(&data, 468.0);
             let alt = shape.and_then(|s| s.attr("alt")).or_else(|| img.attr("o:title")).unwrap_or("").to_string();
-            return Some(Inline::Image(Image { data, width: w.unwrap_or(nw), height: h.unwrap_or(nh), alt, float: None }));
+            return Some(Inline::Image(Image { data, width: w.unwrap_or(nw), height: h.unwrap_or(nh), alt, float }));
         }
         if let Some(tb) = el.find("w:txbxContent") {
-            self.textbox(tb);
+            let paragraphs = self.textbox_paras(tb);
+            let shape = shape?;
+            let fill = if shape.attr("filled").map(vml_false).unwrap_or(false) {
+                None
+            } else {
+                Some(shape.attr("fillcolor").and_then(vml_color).unwrap_or(Color::WHITE))
+            };
+            let border = if shape.attr("stroked").map(vml_false).unwrap_or(false) {
+                None
+            } else {
+                Some(Border {
+                    style: BorderStyle::Single,
+                    width: shape.attr("strokeweight").and_then(parse_length).unwrap_or(0.75),
+                    color: shape.attr("strokecolor").and_then(vml_color).unwrap_or(Color::BLACK),
+                    space: 0.0,
+                })
+            };
+            let vtb = shape.child("v:textbox");
+            let padding = vtb.and_then(|t| t.attr("inset")).and_then(|i| i.split(',').next().and_then(|v| parse_length(v.trim()))).unwrap_or(7.2);
+            let auto_height = vtb.and_then(|t| t.attr("style")).map(|s| s.replace(' ', "").contains("mso-fit-shape-to-text:t")).unwrap_or(false);
+            return Some(Inline::TextBox(Box::new(TextBox {
+                paragraphs,
+                width: w.unwrap_or(144.0),
+                height: h.unwrap_or(72.0),
+                float,
+                fill,
+                border,
+                padding,
+                auto_height,
+            })));
         }
         None
     }
@@ -1285,6 +1527,13 @@ impl<'a> Reader<'a> {
     // ----- tables -----
 
     fn table(&mut self, el: &Element) -> Table {
+        self.nest += 1;
+        let t = self.table_inner(el);
+        self.nest -= 1;
+        t
+    }
+
+    fn table_inner(&mut self, el: &Element) -> Table {
         let mut t = Table { style: None, borders: Borders::default(), ..Default::default() };
         let mut has_borders = false;
         if let Some(pr) = el.child("w:tblPr") {
@@ -1427,17 +1676,233 @@ fn collect_named<'e>(el: &'e Element, name: &str, out: &mut Vec<&'e Element>) {
     }
 }
 
-/// Pick the branch of an `mc:AlternateContent` to read: a Choice with a picture, else the Fallback,
-/// else the first Choice.
+/// Pick the branch of an `mc:AlternateContent` to read: a Choice with a picture, shape or group we
+/// understand, else the Fallback, else the first Choice.
 fn choose_alternate(ac: &Element) -> Option<&Element> {
     let choices: Vec<&Element> = ac.children_named("mc:Choice").collect();
-    if let Some(c) = choices.iter().find(|c| c.find("a:blip").is_some()) {
+    if let Some(c) = choices.iter().find(|c| c.find("a:blip").is_some() || c.find("wps:wsp").is_some() || c.find("wpg:wgp").is_some()) {
         return Some(c);
     }
     if let Some(f) = ac.child("mc:Fallback") {
         return Some(f);
     }
     choices.first().copied()
+}
+
+const EMU_PER_PT: f32 = 12700.0;
+
+/// Floating placement of a `wp:anchor`.
+fn anchor_float(a: &Element) -> Float {
+    let emu = |e: &Element, n: &str| num_attr(e, n).map(|v| v / EMU_PER_PT);
+    let mut f = Float { dist: ["distL", "distR", "distT", "distB"].iter().filter_map(|n| emu(a, n)).fold(0.0, f32::max), ..Default::default() };
+    let behind = a.attr("behindDoc").map(|v| v == "1" || v == "true").unwrap_or(false);
+    for c in a.elems() {
+        match c.name.as_str() {
+            "wp:wrapSquare" => f.wrap = WrapMode::Square,
+            "wp:wrapTight" | "wp:wrapThrough" => f.wrap = WrapMode::Tight,
+            "wp:wrapTopAndBottom" => f.wrap = WrapMode::TopBottom,
+            "wp:wrapNone" => f.wrap = if behind { WrapMode::Behind } else { WrapMode::InFront },
+            _ => {}
+        }
+    }
+    let text_of = |e: &Element, n: &str| e.child(n).map(|x| x.text().trim().to_string());
+    if a.attr("simplePos").map(|v| v == "1" || v == "true").unwrap_or(false) {
+        if let Some(sp) = a.child("wp:simplePos") {
+            f.h_rel = HRel::Page;
+            f.v_rel = VRel::Page;
+            f.x = emu(sp, "x").unwrap_or(0.0);
+            f.y = emu(sp, "y").unwrap_or(0.0);
+            return f;
+        }
+    }
+    if let Some(ph) = a.child("wp:positionH") {
+        f.h_rel = match ph.attr("relativeFrom").unwrap_or("column") {
+            "page" | "leftMargin" | "rightMargin" | "outsideMargin" => HRel::Page,
+            "margin" | "insideMargin" => HRel::Margin,
+            "character" => HRel::Character,
+            _ => HRel::Column,
+        };
+        if let Some(v) = text_of(ph, "wp:posOffset").and_then(|t| t.parse::<f32>().ok()) {
+            f.x = v / EMU_PER_PT;
+        }
+        f.h_align = text_of(ph, "wp:align").map(|t| match t.as_str() {
+            "center" => FloatAlign::Center,
+            "right" | "outside" => FloatAlign::End,
+            _ => FloatAlign::Start,
+        });
+        if ph.attr("relativeFrom") == Some("rightMargin") && f.h_align.is_none() {
+            // Offsets from the right margin area cannot be expressed; keep the object at the right edge.
+            f.h_rel = HRel::Margin;
+            f.h_align = Some(FloatAlign::End);
+        }
+    }
+    if let Some(pv) = a.child("wp:positionV") {
+        f.v_rel = match pv.attr("relativeFrom").unwrap_or("paragraph") {
+            "page" | "topMargin" | "bottomMargin" | "outsideMargin" => VRel::Page,
+            "margin" | "insideMargin" => VRel::Margin,
+            "line" => VRel::Line,
+            _ => VRel::Paragraph,
+        };
+        if let Some(v) = text_of(pv, "wp:posOffset").and_then(|t| t.parse::<f32>().ok()) {
+            f.y = v / EMU_PER_PT;
+        }
+        f.v_align = text_of(pv, "wp:align").map(|t| match t.as_str() {
+            "center" => FloatAlign::Center,
+            "bottom" | "outside" => FloatAlign::End,
+            _ => FloatAlign::Start,
+        });
+        if pv.attr("relativeFrom") == Some("bottomMargin") && f.v_align.is_none() {
+            f.v_rel = VRel::Margin;
+            f.v_align = Some(FloatAlign::End);
+        }
+    }
+    f
+}
+
+fn line_dash(ln: &Element) -> BorderStyle {
+    if ln.attr("cmpd").map(|c| c != "sng").unwrap_or(false) {
+        return BorderStyle::Double;
+    }
+    match ln.child("a:prstDash").and_then(|d| d.attr("val")) {
+        Some("dot" | "sysDot") => BorderStyle::Dotted,
+        Some("solid") | None => BorderStyle::Single,
+        Some(_) => BorderStyle::Dashed,
+    }
+}
+
+/// Apply DrawingML luminance / shade / tint modifiers.
+fn adjust_color(c: Color, lum_mod: Option<f32>, lum_off: Option<f32>, shade: Option<f32>, tint: Option<f32>) -> Color {
+    let (mut r, mut g, mut b) = (c.r as f32 / 255.0, c.g as f32 / 255.0, c.b as f32 / 255.0);
+    if lum_mod.is_some() || lum_off.is_some() {
+        let max = r.max(g).max(b);
+        let min = r.min(g).min(b);
+        let mut l = (max + min) / 2.0;
+        let d = max - min;
+        let (h, s) = if d == 0.0 {
+            (0.0, 0.0)
+        } else {
+            let s = if l > 0.5 { d / (2.0 - max - min) } else { d / (max + min) };
+            let h = if max == r {
+                (g - b) / d + if g < b { 6.0 } else { 0.0 }
+            } else if max == g {
+                (b - r) / d + 2.0
+            } else {
+                (r - g) / d + 4.0
+            } / 6.0;
+            (h, s)
+        };
+        l = (l * lum_mod.unwrap_or(1.0) + lum_off.unwrap_or(0.0)).clamp(0.0, 1.0);
+        let hue = |p: f32, q: f32, mut t: f32| {
+            if t < 0.0 {
+                t += 1.0;
+            }
+            if t > 1.0 {
+                t -= 1.0;
+            }
+            if t < 1.0 / 6.0 {
+                p + (q - p) * 6.0 * t
+            } else if t < 0.5 {
+                q
+            } else if t < 2.0 / 3.0 {
+                p + (q - p) * (2.0 / 3.0 - t) * 6.0
+            } else {
+                p
+            }
+        };
+        if s == 0.0 {
+            r = l;
+            g = l;
+            b = l;
+        } else {
+            let q = if l < 0.5 { l * (1.0 + s) } else { l + s - l * s };
+            let p = 2.0 * l - q;
+            r = hue(p, q, h + 1.0 / 3.0);
+            g = hue(p, q, h);
+            b = hue(p, q, h - 1.0 / 3.0);
+        }
+    }
+    if let Some(sh) = shade {
+        r *= sh;
+        g *= sh;
+        b *= sh;
+    }
+    if let Some(t) = tint {
+        r = 1.0 - (1.0 - r) * t;
+        g = 1.0 - (1.0 - g) * t;
+        b = 1.0 - (1.0 - b) * t;
+    }
+    let ch = |v: f32| (v * 255.0).round().clamp(0.0, 255.0) as u8;
+    Color::rgb(ch(r), ch(g), ch(b))
+}
+
+/// Split a VML `style` attribute into lower-case property → value.
+fn parse_vml_style(style: &str) -> HashMap<String, String> {
+    style
+        .split(';')
+        .filter_map(|d| d.split_once(':'))
+        .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+        .collect()
+}
+
+fn vml_false(v: &str) -> bool {
+    matches!(v.trim().to_ascii_lowercase().as_str(), "f" | "false" | "0")
+}
+
+fn vml_color(v: &str) -> Option<Color> {
+    let v = v.split_whitespace().next()?;
+    css_color(v)
+}
+
+/// Floating placement of an absolutely positioned VML shape (None when it is inline).
+fn vml_float(shape: &Element, css: &HashMap<String, String>) -> Option<Float> {
+    if css.get("position").map(|p| p != "absolute").unwrap_or(true) {
+        return None;
+    }
+    let mut f = Float::default();
+    let len = |k: &str| css.get(k).and_then(|v| parse_length(v));
+    f.x = len("margin-left").or_else(|| len("left")).unwrap_or(0.0);
+    f.y = len("margin-top").or_else(|| len("top")).unwrap_or(0.0);
+    f.h_rel = match css.get("mso-position-horizontal-relative").map(|s| s.as_str()) {
+        Some("page" | "left-margin-area" | "right-margin-area" | "outer-margin-area") => HRel::Page,
+        Some("margin" | "inner-margin-area") => HRel::Margin,
+        Some("char") => HRel::Character,
+        _ => HRel::Column,
+    };
+    f.v_rel = match css.get("mso-position-vertical-relative").map(|s| s.as_str()) {
+        Some("page" | "top-margin-area" | "bottom-margin-area" | "outer-margin-area") => VRel::Page,
+        Some("margin" | "inner-margin-area") => VRel::Margin,
+        Some("line") => VRel::Line,
+        _ => VRel::Paragraph,
+    };
+    f.h_align = match css.get("mso-position-horizontal").map(|s| s.as_str()) {
+        Some("left" | "inside") => Some(FloatAlign::Start),
+        Some("center") => Some(FloatAlign::Center),
+        Some("right" | "outside") => Some(FloatAlign::End),
+        _ => None,
+    };
+    f.v_align = match css.get("mso-position-vertical").map(|s| s.as_str()) {
+        Some("top" | "inside") => Some(FloatAlign::Start),
+        Some("center") => Some(FloatAlign::Center),
+        Some("bottom" | "outside") => Some(FloatAlign::End),
+        _ => None,
+    };
+    let behind = css.get("z-index").and_then(|z| z.parse::<i64>().ok()).map(|z| z < 0).unwrap_or(false);
+    let wrap = shape.child("w10:wrap").and_then(|w| w.attr("type"));
+    f.wrap = match wrap {
+        Some("square") => WrapMode::Square,
+        Some("tight" | "through") => WrapMode::Tight,
+        Some("topAndBottom") => WrapMode::TopBottom,
+        _ if behind => WrapMode::Behind,
+        _ => WrapMode::InFront,
+    };
+    f.dist = ["mso-wrap-distance-left", "mso-wrap-distance-right", "mso-wrap-distance-top", "mso-wrap-distance-bottom"]
+        .iter()
+        .filter_map(|k| len(k))
+        .fold(0.0, f32::max);
+    if f.dist == 0.0 && matches!(f.wrap, WrapMode::Square | WrapMode::Tight) {
+        f.dist = 9.0;
+    }
+    Some(f)
 }
 
 /// Flatten blocks to paragraphs (tables become one paragraph per row, cells separated by tabs).

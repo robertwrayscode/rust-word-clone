@@ -339,3 +339,183 @@ pub fn kitchen_sink() -> Document {
     ];
     doc
 }
+
+/// A larger (24×12 px) PNG so rendered output shows a visible picture.
+pub fn png_big() -> Arc<ImageData> {
+    // Build a solid-colour PNG by hand (stored zlib blocks, no compression).
+    let (w, h) = (24u32, 12u32);
+    let row: Vec<u8> = std::iter::once(0u8).chain([0x20u8, 0x60, 0xC0].repeat(w as usize)).collect();
+    let raw = row.repeat(h as usize);
+    fn crc32(data: &[u8]) -> u32 {
+        let mut c = 0xFFFF_FFFFu32;
+        for &b in data {
+            c ^= b as u32;
+            for _ in 0..8 {
+                c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+            }
+        }
+        !c
+    }
+    fn adler(data: &[u8]) -> u32 {
+        let (mut a, mut b) = (1u32, 0u32);
+        for &x in data {
+            a = (a + x as u32) % 65521;
+            b = (b + a) % 65521;
+        }
+        (b << 16) | a
+    }
+    let mut z = vec![0x78, 0x01, 1];
+    let len = raw.len() as u16;
+    z.extend_from_slice(&len.to_le_bytes());
+    z.extend_from_slice(&(!len).to_le_bytes());
+    z.extend_from_slice(&raw);
+    z.extend_from_slice(&adler(&raw).to_be_bytes());
+    let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    let mut chunk = |t: &[u8], d: &[u8]| {
+        png.extend_from_slice(&(d.len() as u32).to_be_bytes());
+        let mut c = t.to_vec();
+        c.extend_from_slice(d);
+        png.extend_from_slice(&c);
+        png.extend_from_slice(&crc32(&c).to_be_bytes());
+    };
+    let mut ihdr = Vec::new();
+    ihdr.extend_from_slice(&w.to_be_bytes());
+    ihdr.extend_from_slice(&h.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+    chunk(b"IHDR", &ihdr);
+    chunk(b"IDAT", &z);
+    chunk(b"IEND", &[]);
+    image_data(png)
+}
+
+/// Three sections (portrait Letter with own headers; landscape A4 linked to the previous headers;
+/// a continuous last section with its own headers), a Square-wrapped floating picture positioned
+/// relative to the margin, a picture behind the text and a filled, bordered text box.
+pub fn sections_doc() -> Document {
+    let mut doc = Document::new();
+    let hf = |h: &str, f: &str| HeadersFooters {
+        header: vec![Block::Para(Paragraph::with_text(h))],
+        footer: vec![Block::Para(Paragraph::with_text(f))],
+        ..Default::default()
+    };
+    let letter = PageSetup { width: 612.0, height: 792.0, ..Default::default() };
+    let a4_land = PageSetup { width: 841.9, height: 595.3, margin_left: 54.0, margin_right: 54.0, ..Default::default() };
+    let square = Float { wrap: WrapMode::Square, h_rel: HRel::Margin, v_rel: VRel::Paragraph, x: 36.0, y: 18.0, h_align: None, v_align: None, dist: 9.0 };
+    let behind = Float { wrap: WrapMode::Behind, h_rel: HRel::Page, v_rel: VRel::Page, x: 0.0, y: 0.0, h_align: Some(FloatAlign::Center), v_align: Some(FloatAlign::Center), dist: 0.0 };
+    let tb = TextBox {
+        paragraphs: vec![Paragraph::with_text("Box line one"), Paragraph::with_text("Box line two")],
+        width: 180.0,
+        height: 72.0,
+        float: Some(Float { wrap: WrapMode::Square, h_rel: HRel::Margin, v_rel: VRel::Margin, x: 270.0, y: 300.0, h_align: None, v_align: None, dist: 9.0 }),
+        fill: Some(Color::rgb(0xFF, 0xF2, 0xCC)),
+        border: Some(Border { style: BorderStyle::Single, width: 1.5, color: Color::rgb(0xC0, 0x00, 0x00), space: 0.0 }),
+        padding: 7.2,
+        auto_height: false,
+    };
+    let filler = "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.";
+    let mut body = vec![Block::Para(Paragraph::with_text("Section one text"))];
+    body.push(Block::Para(para(vec![
+        inline(Inline::Image(Image { data: png_big(), width: 144.0, height: 72.0, alt: "Square picture".into(), float: Some(square) })),
+        Run::text(filler),
+        Run::text(" "),
+        Run::text(filler),
+    ])));
+    body.push(Block::Para(para(vec![Run::text("Anchor of the box"), inline(Inline::TextBox(Box::new(tb)))])));
+    let mut end1 = Paragraph::with_text("End of section one");
+    end1.section = Some(Box::new(Section { page: letter, headers: Some(hf("Header S1", "Footer S1")) }));
+    body.push(Block::Para(end1));
+    body.push(Block::Para(para(vec![
+        Run::text("Section two text"),
+        inline(Inline::Image(Image { data: png_big(), width: 200.0, height: 100.0, alt: "Behind picture".into(), float: Some(behind) })),
+    ])));
+    let mut end2 = Paragraph::with_text("End of section two");
+    end2.section = Some(Box::new(Section { page: a4_land.clone(), headers: None }));
+    body.push(Block::Para(end2));
+    body.push(Block::Para(Paragraph::with_text("Section three text")));
+    for i in 0..60 {
+        body.push(Block::Para(Paragraph::with_text(&format!("Filler line {i} of section three"))));
+    }
+    doc.body = body;
+    doc.page = PageSetup { start: SectionStart::Continuous, columns: 2, column_gap: 18.0, ..a4_land };
+    doc.headers = hf("Header S3", "Footer S3");
+    doc
+}
+
+/// Check the structure of a re-read [`sections_doc`].
+pub fn check_sections_doc(doc: &Document, what: &str) {
+    let secs = doc.sections();
+    assert_eq!(secs.len(), 2, "{what}: section count");
+    let s0 = &secs[0].page;
+    assert!((s0.width - 612.0).abs() < 0.5 && (s0.height - 792.0).abs() < 0.5, "{what}: section 1 page {}x{}", s0.width, s0.height);
+    let s1 = &secs[1].page;
+    assert!((s1.width - 841.9).abs() < 0.5 && (s1.height - 595.3).abs() < 0.5, "{what}: section 2 page {}x{}", s1.width, s1.height);
+    assert!((s1.margin_left - 54.0).abs() < 0.5, "{what}: section 2 margin");
+    assert_eq!(doc.page.start, SectionStart::Continuous, "{what}: last section start");
+    assert_eq!(doc.page.columns, 2, "{what}: last section columns");
+    let text = |b: &[Block]| b.iter().filter_map(|b| b.as_para()).map(|p| p.text()).collect::<Vec<_>>().join("|");
+    assert_eq!(text(&doc.section_headers(0).header), "Header S1", "{what}: section 1 header");
+    assert_eq!(text(&doc.section_headers(0).footer), "Footer S1", "{what}: section 1 footer");
+    assert_eq!(text(&doc.section_headers(1).header), "Header S1", "{what}: section 2 header (linked)");
+    assert_eq!(text(&doc.headers.header), "Header S3", "{what}: section 3 header");
+    assert_eq!(text(&doc.headers.footer), "Footer S3", "{what}: section 3 footer");
+    // Section-ending paragraphs.
+    assert!(find_para(doc, "End of section one").section.is_some(), "{what}: end of section one");
+    assert!(find_para(doc, "End of section two").section.is_some(), "{what}: end of section two");
+    assert!(find_para(doc, "Section two text").section.is_none(), "{what}");
+    // Floating pictures.
+    let imgs: Vec<&Image> = body_paras(doc).iter().flat_map(|p| p.runs.iter()).filter_map(|r| if let Inline::Image(i) = &r.content { Some(i) } else { None }).collect();
+    assert_eq!(imgs.len(), 2, "{what}: images");
+    let sq = imgs[0].float.unwrap_or_else(|| panic!("{what}: square picture is not floating"));
+    assert_eq!(sq.wrap, WrapMode::Square, "{what}");
+    assert_eq!(sq.h_rel, HRel::Margin, "{what}");
+    assert_eq!(sq.v_rel, VRel::Paragraph, "{what}");
+    assert!((sq.x - 36.0).abs() < 0.5 && (sq.y - 18.0).abs() < 0.5, "{what}: square offsets {} {}", sq.x, sq.y);
+    assert!((imgs[0].width - 144.0).abs() < 0.5 && (imgs[0].height - 72.0).abs() < 0.5, "{what}: square size");
+    let bh = imgs[1].float.unwrap_or_else(|| panic!("{what}: behind picture is not floating"));
+    assert_eq!(bh.wrap, WrapMode::Behind, "{what}");
+    assert_eq!(bh.h_align, Some(FloatAlign::Center), "{what}");
+    assert_eq!(bh.v_align, Some(FloatAlign::Center), "{what}");
+    // Text box.
+    let tb = body_paras(doc)
+        .iter()
+        .flat_map(|p| p.runs.iter())
+        .find_map(|r| if let Inline::TextBox(t) = &r.content { Some(t.as_ref().clone()) } else { None })
+        .unwrap_or_else(|| panic!("{what}: no text box"));
+    assert_eq!(tb.paragraphs.iter().map(|p| p.text()).collect::<Vec<_>>(), vec!["Box line one", "Box line two"], "{what}: text box text");
+    assert_eq!(tb.fill, Some(Color::rgb(0xFF, 0xF2, 0xCC)), "{what}: text box fill");
+    let b = tb.border.unwrap_or_else(|| panic!("{what}: text box border"));
+    assert_eq!(b.color, Color::rgb(0xC0, 0, 0), "{what}: border colour");
+    assert!((b.width - 1.5).abs() < 0.1, "{what}: border width {}", b.width);
+    assert!((tb.width - 180.0).abs() < 0.5 && (tb.height - 72.0).abs() < 0.5, "{what}: text box size {}x{}", tb.width, tb.height);
+    let f = tb.float.unwrap_or_else(|| panic!("{what}: text box not floating"));
+    assert_eq!((f.h_rel, f.v_rel), (HRel::Margin, VRel::Margin), "{what}: text box relative to");
+    assert!((f.x - 270.0).abs() < 0.5 && (f.y - 300.0).abs() < 0.5, "{what}: text box offsets {} {}", f.x, f.y);
+    assert!(!plain_has(doc, "Box line one"), "{what}: text box text leaked into the body");
+}
+
+/// Whether some top-level body paragraph's own text contains `needle`.
+pub fn plain_has(doc: &Document, needle: &str) -> bool {
+    body_paras(doc).iter().any(|p| p.text().contains(needle))
+}
+
+/// Render a PDF page to PNG (for manual inspection).
+pub fn pdf_to_png(pdf: &std::path::Path, prefix: &std::path::Path) {
+    let _ = std::process::Command::new("pdftoppm").args(["-png", "-r", "50"]).arg(pdf).arg(prefix).output();
+}
+
+/// Page sizes (points) of a PDF via pdfinfo.
+pub fn pdf_page_sizes(pdf: &std::path::Path) -> Vec<(f32, f32)> {
+    let Ok(out) = std::process::Command::new("pdfinfo").args(["-f", "1", "-l", "50"]).arg(pdf).output() else { return vec![] };
+    let s = String::from_utf8_lossy(&out.stdout);
+    s.lines()
+        .filter(|l| l.starts_with("Page") && l.contains("size:"))
+        .filter_map(|l| {
+            let rest = l.split("size:").nth(1)?;
+            let mut it = rest.split_whitespace();
+            let w = it.next()?.parse().ok()?;
+            it.next();
+            let h = it.next()?.parse().ok()?;
+            Some((w, h))
+        })
+        .collect()
+}

@@ -161,11 +161,34 @@ impl<'a> MdWriter<'a> {
                         continue;
                     }
                     self.paragraph(out, p, &rp.style);
+                    self.textboxes(out, p);
                     i += 1;
                 }
             }
         }
         if in_list {
+            out.push('\n');
+        }
+    }
+
+    /// Text boxes anchored in a paragraph follow it as a block quote.
+    fn textboxes(&mut self, out: &mut String, p: &Paragraph) {
+        for r in &p.runs {
+            let Inline::TextBox(tb) = &r.content else { continue };
+            let blocks: Vec<Block> = tb.paragraphs.iter().cloned().map(Block::Para).collect();
+            let mut inner = String::new();
+            self.blocks(&mut inner, &blocks);
+            let inner = inner.trim_end();
+            if inner.is_empty() {
+                continue;
+            }
+            for line in inner.lines() {
+                if line.is_empty() {
+                    out.push_str(">\n");
+                } else {
+                    let _ = writeln!(out, "> {}", line);
+                }
+            }
             out.push('\n');
         }
     }

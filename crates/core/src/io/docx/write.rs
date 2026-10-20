@@ -29,6 +29,8 @@ fn root_ns() -> String {
             r#"xmlns:w15="http://schemas.microsoft.com/office/word/2012/wordml" "#,
             r#"xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" "#,
             r#"xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture" "#,
+            r#"xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape" "#,
+            r#"xmlns:wpg="http://schemas.microsoft.com/office/word/2010/wordprocessingGroup" "#,
             r#"mc:Ignorable="w14 w15""#
         ),
         r = NS_R,
@@ -137,60 +139,95 @@ pub fn write(doc: &Document) -> Result<Vec<u8>, String> {
     let mut overrides: Vec<(String, String)> = Vec::new();
     let mut doc_rels = PartCtx::default();
 
-    // Headers and footers.
-    let mut hf_refs = String::new();
-    let watermark = doc.page.watermark.as_deref().filter(|s| !s.trim().is_empty());
-    let hf: [(&str, &str, &Vec<Block>, bool); 4] = [
-        ("header", "default", &doc.headers.header, true),
-        ("header", "first", &doc.headers.first_header, doc.page.title_page),
-        ("footer", "default", &doc.headers.footer, true),
-        ("footer", "first", &doc.headers.first_footer, doc.page.title_page),
-    ];
-    let mut counters = HashMap::new();
-    for (kind, ty, blocks, allowed) in hf {
-        let has_content = !blocks.is_empty() || (kind == "header" && watermark.is_some());
-        // With a different first page, always write the first-page parts so the first page is blank.
-        if !allowed || (!has_content && ty == "default") {
+    // Headers and footers, per section. Word inherits every header/footer kind a section does not
+    // reference from the previous section, so a part is written only where the displayed content
+    // changes. The model resolves a first section without own headers to the last section's, which
+    // Word would show as empty, so that section always gets references.
+    let secs = doc.sections();
+    let nsec = secs.len() + 1;
+    let mut sect_refs: Vec<String> = Vec::with_capacity(nsec);
+    let mut prev: [Option<(&Vec<Block>, Option<&str>)>; 4] = [None, None, None, None];
+    let mut counters: HashMap<&str, usize> = HashMap::new();
+    for i in 0..nsec {
+        let (page, hf) = match secs.get(i) {
+            Some(s) => (&s.page, s.headers.as_ref().or(if i == 0 { Some(doc.section_headers(0)) } else { None })),
+            None => (&doc.page, Some(&doc.headers)),
+        };
+        let mut refs = String::new();
+        let Some(hf) = hf else {
+            sect_refs.push(refs);
             continue;
+        };
+        let watermark = page.watermark.as_deref().filter(|s| !s.trim().is_empty());
+        let kinds: [(&str, &str, HfKind); 4] = [
+            ("header", "default", HfKind::Header),
+            ("header", "first", HfKind::FirstHeader),
+            ("footer", "default", HfKind::Footer),
+            ("footer", "first", HfKind::FirstFooter),
+        ];
+        for (k, (kind, ty, hk)) in kinds.into_iter().enumerate() {
+            let blocks = hf.part(hk);
+            let wm = if kind == "header" { watermark } else { None };
+            let key = (blocks, wm);
+            let needed = match &prev[k] {
+                Some(p) => *p != key,
+                // With a different first page, write the first-page parts so the first page is blank.
+                None => !blocks.is_empty() || wm.is_some() || (ty == "first" && page.title_page),
+            };
+            if !needed {
+                continue;
+            }
+            prev[k] = Some(key);
+            let n = counters.entry(kind).or_insert(0);
+            *n += 1;
+            let name = format!("{}{}.xml", kind, n);
+            let mut pc = PartCtx::default();
+            let mut body = String::new();
+            if let Some(wm) = wm {
+                body.push_str(&watermark_para(wm));
+            }
+            w.blocks(&mut body, blocks, &mut pc);
+            if body.is_empty() || matches!(blocks.last(), Some(Block::Table(_))) {
+                body.push_str("<w:p/>");
+            }
+            let tag = if kind == "header" { "w:hdr" } else { "w:ftr" };
+            let xml = format!("{}<{} {}>{}</{}>", XML_DECL, tag, root_ns(), body, tag);
+            zip.add(&format!("word/{}", name), xml.as_bytes())?;
+            if !pc.rels.is_empty() {
+                zip.add(&format!("word/_rels/{}.rels", name), pc.xml().as_bytes())?;
+            }
+            overrides.push((format!("/word/{}", name), format!("{}.{}+xml", CT_WML, kind)));
+            let rid = doc_rels.add(&format!("{}/{}", REL, kind), &name, false);
+            let _ = write!(refs, r#"<w:{}Reference w:type="{}" r:id="{}"/>"#, kind, ty, rid);
         }
-        let n = counters.entry(kind).or_insert(0);
-        *n += 1;
-        let name = format!("{}{}.xml", kind, n);
-        let mut pc = PartCtx::default();
-        let mut body = String::new();
-        if let (true, Some(wm)) = (kind == "header", watermark) {
-            body.push_str(&watermark_para(wm));
-        }
-        w.blocks(&mut body, blocks, &mut pc);
-        if body.is_empty() || matches!(blocks.last(), Some(Block::Table(_))) {
-            body.push_str("<w:p/>");
-        }
-        let tag = if kind == "header" { "w:hdr" } else { "w:ftr" };
-        let xml = format!("{}<{} {}>{}</{}>", XML_DECL, tag, root_ns(), body, tag);
-        zip.add(&format!("word/{}", name), xml.as_bytes())?;
-        if !pc.rels.is_empty() {
-            zip.add(&format!("word/_rels/{}.rels", name), pc.xml().as_bytes())?;
-        }
-        overrides.push((format!("/word/{}", name), format!("{}.{}+xml", CT_WML, kind)));
-        let rid = doc_rels.add(&format!("{}/{}", REL, kind), &name, false);
-        let _ = write!(hf_refs, r#"<w:{}Reference w:type="{}" r:id="{}"/>"#, kind, ty, rid);
-    }
-    // Header references must precede footer references.
-    let hf_refs = {
-        let mut parts: Vec<&str> = hf_refs.split_inclusive("/>").collect();
+        // Header references must precede footer references.
+        let mut parts: Vec<&str> = refs.split_inclusive("/>").collect();
         parts.sort_by_key(|p| !p.starts_with("<w:headerReference"));
-        parts.concat()
-    };
+        sect_refs.push(parts.concat());
+    }
 
     // Main document.
     let mut body = String::new();
     doc_rels.body = true;
-    w.blocks(&mut body, &doc.body, &mut doc_rels);
+    let mut sec_i = 0;
+    for b in &doc.body {
+        match b {
+            Block::Para(p) => {
+                let sect = p.section.as_ref().map(|s| {
+                    let x = sect_pr(&s.page, sect_refs.get(sec_i).map(|s| s.as_str()).unwrap_or(""));
+                    sec_i += 1;
+                    x
+                });
+                w.paragraph_ex(&mut body, p, &mut doc_rels, None, sect.as_deref());
+            }
+            Block::Table(t) => w.table(&mut body, t, &mut doc_rels),
+        }
+    }
     doc_rels.body = false;
     if doc.body.is_empty() || matches!(doc.body.last(), Some(Block::Table(_))) {
         body.push_str("<w:p/>");
     }
-    body.push_str(&sect_pr(doc, &hf_refs));
+    body.push_str(&sect_pr(&doc.page, sect_refs.last().map(|s| s.as_str()).unwrap_or("")));
     let background = doc.page.page_color.map(|c| format!(r#"<w:background w:color="{}"/>"#, c.to_hex())).unwrap_or_default();
     let document_xml = format!("{}<w:document {}>{}<w:body>{}</w:body></w:document>", XML_DECL, root_ns(), background, body);
 
@@ -545,10 +582,15 @@ fn text_xml(out: &mut String, s: &str, deleted: bool) {
     flush(out, &mut seg);
 }
 
-fn sect_pr(doc: &Document, hf_refs: &str) -> String {
-    let p = &doc.page;
+fn sect_pr(p: &PageSetup, hf_refs: &str) -> String {
     let mut s = String::from("<w:sectPr>");
     s.push_str(hf_refs);
+    match p.start {
+        SectionStart::NextPage => {}
+        SectionStart::Continuous => s.push_str(r#"<w:type w:val="continuous"/>"#),
+        SectionStart::EvenPage => s.push_str(r#"<w:type w:val="evenPage"/>"#),
+        SectionStart::OddPage => s.push_str(r#"<w:type w:val="oddPage"/>"#),
+    }
     let orient = if p.width > p.height { r#" w:orient="landscape""# } else { "" };
     let _ = write!(s, r#"<w:pgSz w:w="{}" w:h="{}"{}/>"#, twips(p.width), twips(p.height), orient);
     let _ = write!(
@@ -577,6 +619,68 @@ fn sect_pr(doc: &Document, hf_refs: &str) -> String {
     s.push_str(r#"<w:docGrid w:linePitch="360"/>"#);
     s.push_str("</w:sectPr>");
     s
+}
+
+/// Opening (up to and including `wp:docPr`) and closing tags of a `wp:inline` or, for floating
+/// objects, a `wp:anchor`.
+fn drawing_frame(float: Option<&Float>, cx: i64, cy: i64, id: u32, name: &str, descr: &str) -> (String, String) {
+    let ext = format!(r#"<wp:extent cx="{cx}" cy="{cy}"/><wp:effectExtent l="0" t="0" r="0" b="0"/>"#);
+    let doc_pr = format!(r#"<wp:docPr id="{}" name="{}" descr="{}"/>"#, id, esc_attr(name), esc_attr(descr));
+    let Some(f) = float else {
+        return (format!(r#"<wp:inline distT="0" distB="0" distL="0" distR="0">{ext}{doc_pr}"#), "</wp:inline>".into());
+    };
+    let d = emu(f.dist.max(0.0));
+    let behind = f.wrap == WrapMode::Behind;
+    let h_rel = match f.h_rel {
+        HRel::Page => "page",
+        HRel::Margin => "margin",
+        HRel::Column => "column",
+        HRel::Character => "character",
+    };
+    let v_rel = match f.v_rel {
+        VRel::Page => "page",
+        VRel::Margin => "margin",
+        VRel::Paragraph => "paragraph",
+        VRel::Line => "line",
+    };
+    let h_pos = match f.h_align {
+        Some(FloatAlign::Start) => "<wp:align>left</wp:align>".to_string(),
+        Some(FloatAlign::Center) => "<wp:align>center</wp:align>".to_string(),
+        Some(FloatAlign::End) => "<wp:align>right</wp:align>".to_string(),
+        None => format!("<wp:posOffset>{}</wp:posOffset>", emu(f.x)),
+    };
+    let v_pos = match f.v_align {
+        Some(FloatAlign::Start) => "<wp:align>top</wp:align>".to_string(),
+        Some(FloatAlign::Center) => "<wp:align>center</wp:align>".to_string(),
+        Some(FloatAlign::End) => "<wp:align>bottom</wp:align>".to_string(),
+        None => format!("<wp:posOffset>{}</wp:posOffset>", emu(f.y)),
+    };
+    let wrap = match f.wrap {
+        WrapMode::Square => r#"<wp:wrapSquare wrapText="bothSides"/>"#.to_string(),
+        WrapMode::Tight => {
+            r#"<wp:wrapTight wrapText="bothSides"><wp:wrapPolygon edited="0"><wp:start x="0" y="0"/><wp:lineTo x="0" y="21600"/><wp:lineTo x="21600" y="21600"/><wp:lineTo x="21600" y="0"/><wp:lineTo x="0" y="0"/></wp:wrapPolygon></wp:wrapTight>"#.to_string()
+        }
+        WrapMode::TopBottom => "<wp:wrapTopAndBottom/>".to_string(),
+        WrapMode::Behind | WrapMode::InFront => "<wp:wrapNone/>".to_string(),
+    };
+    let open = format!(
+        concat!(
+            r#"<wp:anchor distT="{d}" distB="{d}" distL="{d}" distR="{d}" simplePos="0" relativeHeight="{z}" behindDoc="{behind}" locked="0" layoutInCell="1" allowOverlap="1">"#,
+            r#"<wp:simplePos x="0" y="0"/><wp:positionH relativeFrom="{h_rel}">{h_pos}</wp:positionH><wp:positionV relativeFrom="{v_rel}">{v_pos}</wp:positionV>"#,
+            r#"{ext}{wrap}{doc_pr}"#
+        ),
+        d = d,
+        z = 251_658_240u32 + id,
+        behind = if behind { 1 } else { 0 },
+        h_rel = h_rel,
+        h_pos = h_pos,
+        v_rel = v_rel,
+        v_pos = v_pos,
+        ext = ext,
+        wrap = wrap,
+        doc_pr = doc_pr
+    );
+    (open, "</wp:anchor>".into())
 }
 
 fn watermark_para(text: &str) -> String {
@@ -732,12 +836,20 @@ impl<'a> Writer<'a> {
 
     /// `note_ref`: Some(true/false) for the first paragraph of a footnote/endnote (adds the reference mark).
     fn paragraph(&mut self, out: &mut String, p: &Paragraph, pc: &mut PartCtx, note_ref: Option<bool>) {
+        self.paragraph_ex(out, p, pc, note_ref, None)
+    }
+
+    /// `sect`: the `w:sectPr` of the section this paragraph ends.
+    fn paragraph_ex(&mut self, out: &mut String, p: &Paragraph, pc: &mut PartCtx, note_ref: Option<bool>, sect: Option<&str>) {
         out.push_str("<w:p>");
         let mut ppr = ppr_inner(&p.props, &self.list_ids);
         let mark = CharProps { link: None, revision: None, comments: Vec::new(), ..p.mark.clone() };
         let mrpr = rpr_inner(&mark);
         if !mrpr.is_empty() {
             let _ = write!(ppr, "<w:rPr>{}</w:rPr>", mrpr);
+        }
+        if let Some(sp) = sect {
+            ppr.push_str(sp);
         }
         if !ppr.is_empty() {
             let _ = write!(out, "<w:pPr>{}</w:pPr>", ppr);
@@ -820,7 +932,10 @@ impl<'a> Writer<'a> {
         let props = CharProps { link: None, revision: None, comments: Vec::new(), ..run.props.clone() };
         let rp = rpr(&props);
         match &run.content {
-            Inline::TextBox(_) => {}
+            Inline::TextBox(tb) => {
+                let xml = self.textbox_xml(tb, pc);
+                let _ = write!(out, "<w:r>{}{}</w:r>", rp, xml);
+            }
             Inline::Bookmark(name) => {
                 self.bookmark_id += 1;
                 let _ = write!(
@@ -900,23 +1015,79 @@ impl<'a> Writer<'a> {
         self.docpr_id += 1;
         let (cx, cy) = (emu(img.width.max(1.0)), emu(img.height.max(1.0)));
         let id = self.docpr_id;
+        let (open, close) = drawing_frame(img.float.as_ref(), cx, cy, id, &format!("Picture {}", id), &img.alt);
         format!(
             concat!(
-                r#"<w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0"><wp:extent cx="{cx}" cy="{cy}"/>"#,
-                r#"<wp:effectExtent l="0" t="0" r="0" b="0"/><wp:docPr id="{id}" name="Picture {id}" descr="{alt}"/>"#,
-                r#"<wp:cNvGraphicFramePr><a:graphicFrameLocks noChangeAspect="1"/></wp:cNvGraphicFramePr>"#,
+                r#"<w:drawing>{open}<wp:cNvGraphicFramePr><a:graphicFrameLocks noChangeAspect="1"/></wp:cNvGraphicFramePr>"#,
                 r#"<a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">"#,
                 r#"<pic:pic><pic:nvPicPr><pic:cNvPr id="{id}" name="{file}"/><pic:cNvPicPr/></pic:nvPicPr>"#,
                 r#"<pic:blipFill><a:blip r:embed="{rid}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>"#,
                 r#"<pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr>"#,
-                r#"</pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing>"#
+                r#"</pic:pic></a:graphicData></a:graphic>{close}</w:drawing>"#
             ),
+            open = open,
+            close = close,
             cx = cx,
             cy = cy,
             id = id,
-            alt = esc_attr(&img.alt),
             file = esc_attr(name.rsplit('/').next().unwrap_or("image")),
             rid = rid
+        )
+    }
+
+    /// A text box as a WordprocessingML shape (`wps:wsp`) wrapped in `mc:AlternateContent`.
+    fn textbox_xml(&mut self, tb: &TextBox, pc: &mut PartCtx) -> String {
+        self.docpr_id += 1;
+        let id = self.docpr_id;
+        let (cx, cy) = (emu(tb.width.max(1.0)), emu(tb.height.max(1.0)));
+        let (open, close) = drawing_frame(tb.float.as_ref(), cx, cy, id, &format!("Text Box {}", id), "");
+        let fill = match tb.fill {
+            Some(c) => format!(r#"<a:solidFill><a:srgbClr val="{}"/></a:solidFill>"#, c.to_hex()),
+            None => "<a:noFill/>".into(),
+        };
+        let line = match tb.border.filter(|b| b.is_visible()) {
+            Some(b) => {
+                let dash = match b.style {
+                    BorderStyle::Dotted => r#"<a:prstDash val="sysDot"/>"#,
+                    BorderStyle::Dashed => r#"<a:prstDash val="dash"/>"#,
+                    _ => "",
+                };
+                let cmpd = if b.style == BorderStyle::Double { r#" cmpd="dbl""# } else { "" };
+                format!(r#"<a:ln w="{}"{}><a:solidFill><a:srgbClr val="{}"/></a:solidFill>{}</a:ln>"#, emu(b.width.max(0.25)), cmpd, b.color.to_hex(), dash)
+            }
+            None => "<a:ln><a:noFill/></a:ln>".into(),
+        };
+        // Text box paragraphs are not part of the body's comment-range bookkeeping.
+        let saved_body = pc.body;
+        pc.body = false;
+        let mut content = String::new();
+        let paras: Vec<Paragraph> = if tb.paragraphs.is_empty() { vec![Paragraph::new()] } else { tb.paragraphs.clone() };
+        for p in &paras {
+            self.paragraph(&mut content, p, pc, None);
+        }
+        pc.body = saved_body;
+        let ins = emu(tb.padding.max(0.0));
+        let ins_v = emu((tb.padding / 2.0).max(0.0));
+        format!(
+            concat!(
+                r#"<mc:AlternateContent><mc:Choice Requires="wps"><w:drawing>{open}<wp:cNvGraphicFramePr/>"#,
+                r#"<a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">"#,
+                r#"<wps:wsp><wps:cNvSpPr txBox="1"/><wps:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm>"#,
+                r#"<a:prstGeom prst="rect"><a:avLst/></a:prstGeom>{fill}{line}</wps:spPr>"#,
+                r#"<wps:txbx><w:txbxContent>{content}</w:txbxContent></wps:txbx>"#,
+                r#"<wps:bodyPr rot="0" vert="horz" wrap="square" lIns="{ins}" tIns="{insv}" rIns="{ins}" bIns="{insv}" anchor="t" anchorCtr="0">{fit}</wps:bodyPr>"#,
+                r#"</wps:wsp></a:graphicData></a:graphic>{close}</w:drawing></mc:Choice></mc:AlternateContent>"#
+            ),
+            open = open,
+            close = close,
+            cx = cx,
+            cy = cy,
+            fill = fill,
+            line = line,
+            content = content,
+            ins = ins,
+            insv = ins_v,
+            fit = if tb.auto_height { "<a:spAutoFit/>" } else { "<a:noAutofit/>" }
         )
     }
 

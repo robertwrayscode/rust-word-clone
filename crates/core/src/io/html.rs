@@ -86,6 +86,8 @@ struct HtmlWriter<'a> {
     footnotes: Vec<u32>,
     endnotes: Vec<u32>,
     base: ResolvedChars,
+    /// Section of the body block being written.
+    cur_sec: usize,
 }
 
 fn esc(s: &str) -> String {
@@ -164,6 +166,7 @@ impl<'a> HtmlWriter<'a> {
             footnotes: Vec::new(),
             endnotes: Vec::new(),
             base: resolve_chars(doc, "Normal", &CharProps::default()),
+            cur_sec: 0,
         };
         if fragment {
             // Nothing is inherited from a stylesheet: every property is written.
@@ -177,10 +180,25 @@ impl<'a> HtmlWriter<'a> {
     fn blocks(&mut self, out: &mut String, blocks: &[Block]) {
         // Stack of open lists: (list id, ordered).
         let mut stack: Vec<(u32, bool)> = Vec::new();
+        // Section breaks (body only) become page breaks before the next section's first paragraph.
+        let top = std::ptr::eq(blocks.as_ptr(), self.doc.body.as_ptr());
+        let mut break_next = false;
+        let mut sec = 0;
         for b in blocks {
+            let brk = std::mem::take(&mut break_next);
+            if top {
+                self.cur_sec = sec;
+                if let Block::Para(p) = b {
+                    if p.section.is_some() {
+                        sec += 1;
+                        break_next = self.doc.section_page(sec).start != SectionStart::Continuous;
+                    }
+                }
+            }
             match b {
                 Block::Para(p) => {
-                    let rp = resolve_para(self.doc, &p.props);
+                    let mut rp = resolve_para(self.doc, &p.props);
+                    rp.page_break_before |= brk;
                     if let Some(l) = rp.list {
                         self.list_item(out, &mut stack, p, &rp, l);
                     } else {
@@ -332,6 +350,12 @@ impl<'a> HtmlWriter<'a> {
             let base = resolve_chars(self.doc, "Normal", &CharProps::default());
             let _ = write!(css, "font-weight:normal;font-size:{}pt;", fmt_num(base.size));
         }
+        // Text boxes cannot live inside a <p>: they precede their anchor paragraph as floating blocks.
+        for r in &p.runs {
+            if let Inline::TextBox(tb) = &r.content {
+                self.textbox(out, tb);
+            }
+        }
         let _ = write!(out, "<{}{} style=\"{}\">", tag, class, css);
         let mut inner = String::new();
         self.runs(&mut inner, p);
@@ -340,6 +364,48 @@ impl<'a> HtmlWriter<'a> {
         }
         out.push_str(&inner);
         let _ = writeln!(out, "</{}>", tag);
+    }
+
+    /// CSS placing a floating object (`;`-prefixed): float left/right by alignment or offset, or a
+    /// centred / top-and-bottom block.
+    fn float_css(&self, f: &Float, width: f32) -> String {
+        let d = fmt_num(f.dist);
+        let pg = self.doc.section_page(self.cur_sec);
+        let text_w = (pg.width - pg.margin_left - pg.margin_right).max(72.0);
+        let side = match f.h_align {
+            Some(FloatAlign::Start) => Some("left"),
+            Some(FloatAlign::End) => Some("right"),
+            Some(FloatAlign::Center) => None,
+            None => {
+                let x = if f.h_rel == HRel::Page { f.x - pg.margin_left } else { f.x };
+                Some(if x + width / 2.0 > text_w / 2.0 { "right" } else { "left" })
+            }
+        };
+        match side {
+            Some(_) if f.wrap == WrapMode::TopBottom => format!(";display:block;margin:{d}pt 0"),
+            Some("left") => format!(";float:left;margin:0 {d}pt {d}pt 0"),
+            Some(_) => format!(";float:right;margin:0 0 {d}pt {d}pt"),
+            None => format!(";display:block;margin:{d}pt auto"),
+        }
+    }
+
+    fn textbox(&mut self, out: &mut String, tb: &TextBox) {
+        let mut css = format!("width:{}pt;padding:{}pt;box-sizing:border-box;", fmt_num(tb.width), fmt_num(tb.padding));
+        let _ = write!(css, "{}:{}pt;", if tb.auto_height { "min-height" } else { "height" }, fmt_num(tb.height));
+        if let Some(b) = tb.border.filter(|b| b.is_visible()) {
+            let _ = write!(css, "border:{};", css_border(&Some(b)));
+        }
+        if let Some(c) = tb.fill {
+            let _ = write!(css, "background-color:#{};", c.to_hex());
+        }
+        match &tb.float {
+            Some(f) => css.push_str(self.float_css(f, tb.width).trim_start_matches(';')),
+            None => css.push_str("display:inline-block"),
+        }
+        let _ = writeln!(out, "<div class=\"textbox\" style=\"{}\">", css);
+        let blocks: Vec<Block> = tb.paragraphs.iter().cloned().map(Block::Para).collect();
+        self.blocks(out, &blocks);
+        out.push_str("</div>\n");
     }
 
     fn runs(&mut self, out: &mut String, p: &Paragraph) {
@@ -441,15 +507,17 @@ impl<'a> HtmlWriter<'a> {
             Inline::Image(img) => {
                 *at_start = false;
                 let mime = image_mime(&img.data.format);
+                let float = img.float.map(|f| self.float_css(&f, img.width)).unwrap_or_default();
                 let _ = write!(
                     out,
-                    "<img src=\"data:{};base64,{}\" width=\"{}\" height=\"{}\" style=\"width:{}pt;height:{}pt\" alt=\"{}\">",
+                    "<img src=\"data:{};base64,{}\" width=\"{}\" height=\"{}\" style=\"width:{}pt;height:{}pt{}\" alt=\"{}\">",
                     mime,
                     base64_encode(&img.data.bytes),
                     (img.width / 0.75).round() as i64,
                     (img.height / 0.75).round() as i64,
                     fmt_num(img.width),
                     fmt_num(img.height),
+                    float,
                     esc(&img.alt)
                 );
                 return;
@@ -2289,12 +2357,27 @@ impl<'d> HtmlReader<'d> {
         };
         let mut w = None;
         let mut h = None;
+        let mut float = None;
         for (k, v) in d {
             match k.as_str() {
                 "width" => w = parse_length(v).or(w),
                 "height" => h = parse_length(v).or(h),
+                "float" => {
+                    float = match v.trim() {
+                        "left" => Some(FloatAlign::Start),
+                        "right" => Some(FloatAlign::End),
+                        _ => None,
+                    }
+                }
                 _ => {}
             }
+        }
+        if float.is_none() {
+            float = match e.attr("align").map(|a| a.trim().to_ascii_lowercase()) {
+                Some(a) if a == "left" => Some(FloatAlign::Start),
+                Some(a) if a == "right" => Some(FloatAlign::End),
+                _ => None,
+            };
         }
         let px = |v: &str| if v.ends_with('%') { None } else { v.trim().trim_end_matches("px").parse::<f32>().ok().map(|x| x * 0.75) };
         w = w.or_else(|| e.attr("width").and_then(px));
@@ -2306,7 +2389,8 @@ impl<'d> HtmlReader<'d> {
             (None, Some(h)) => (nw * h / nh, h),
             (None, None) => (nw, nh),
         };
-        let img = Image { data, width: round2(w), height: round2(h), alt, float: None };
+        let float = float.map(|a| Float { wrap: WrapMode::Square, h_rel: HRel::Column, v_rel: VRel::Paragraph, h_align: Some(a), ..Default::default() });
+        let img = Image { data, width: round2(w), height: round2(h), alt, float };
         self.push_inline(c, Inline::Image(img));
         self.last_space = false;
     }
