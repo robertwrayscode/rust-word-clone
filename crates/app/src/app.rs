@@ -1339,7 +1339,7 @@ impl App {
         let (w, h) = data.pixel_size.map(|(w, h)| (w as f32 * 0.75, h as f32 * 0.75)).unwrap_or((200.0, 150.0));
         let maxw = self.doc.page.column_width();
         let s = if w > maxw { maxw / w } else { 1.0 };
-        let img = Image { data: Arc::new(data), width: w * s, height: h * s, alt: String::new() };
+        let img = Image { data: Arc::new(data), width: w * s, height: h * s, alt: String::new(), float: None };
         self.insert_inline(Inline::Image(img), label);
     }
 

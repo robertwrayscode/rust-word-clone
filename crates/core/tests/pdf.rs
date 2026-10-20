@@ -137,6 +137,7 @@ fn rich_doc() -> Document {
             width: 120.0,
             height: 90.0,
             alt: String::new(),
+            float: None,
         }),
         props: CharProps::default(),
     });

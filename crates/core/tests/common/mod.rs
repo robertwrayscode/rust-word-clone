@@ -129,6 +129,7 @@ pub fn kitchen_sink() -> Document {
             ..Default::default()
         }),
         watermark: Some("DRAFT".into()),
+        start: SectionStart::NextPage,
     };
     doc.styles.push(Style {
         id: "MyStyle".into(),
@@ -231,7 +232,7 @@ pub fn kitchen_sink() -> Document {
     body.push(Block::Para(al));
     body.push(Block::Para(para(vec![
         Run::text("Image: "),
-        inline(Inline::Image(Image { data: png(), width: 72.0, height: 36.0, alt: "A pixel".into() })),
+        inline(Inline::Image(Image { data: png(), width: 72.0, height: 36.0, alt: "A pixel".into(), float: None })),
         Run::text(" Page "),
         inline(Inline::Field(Field::PageNumber)),
         Run::text(" of "),

@@ -217,7 +217,7 @@ impl Paragraph {
     pub fn split_off(&mut self, off: usize) -> Paragraph {
         let i = self.split_at(off);
         let tail = self.runs.split_off(i);
-        let mut np = Paragraph { runs: tail, props: self.props.clone(), mark: self.mark.clone() };
+        let mut np = Paragraph { runs: tail, props: self.props.clone(), mark: self.mark.clone(), section: self.section.take() };
         np.normalize();
         self.normalize();
         np
@@ -713,10 +713,10 @@ impl Document {
         }
         if a.path.cell.is_none() && b.path.cell.is_none() && a.path.story == b.path.story {
             // Body paragraphs: cut tail of a, drop blocks between, cut head of b, merge.
-            let tail = {
+            let (tail, sec) = {
                 let p = self.para_mut(&b.path).unwrap();
                 p.remove_range(0, b.offset);
-                p.runs.clone()
+                (p.runs.clone(), p.section.take())
             };
             let blocks = self.story_mut(a.path.story);
             blocks.drain(a.path.block + 1..=b.path.block);
@@ -724,6 +724,8 @@ impl Document {
                 let len = pa.len();
                 pa.remove_range(a.offset, len);
                 pa.runs.extend(tail);
+                // The surviving paragraph mark is b's, so b's section break survives.
+                pa.section = sec;
                 pa.normalize();
             }
             return a;
@@ -743,9 +745,11 @@ impl Document {
             // Remove tables strictly between, then merge a and b.
             let story = a.path.story;
             let tail = self.para(&b.path).map(|p| p.runs.clone()).unwrap_or_default();
+            let sec = self.para(&b.path).and_then(|p| p.section.clone());
             let blocks = self.story_mut(story);
             blocks.drain(a.path.block + 1..=b.path.block);
             if let Block::Para(pa) = &mut blocks[a.path.block] {
+                pa.section = sec;
                 pa.runs.extend(tail);
                 pa.normalize();
             }

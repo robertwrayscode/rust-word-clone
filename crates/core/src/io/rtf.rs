@@ -356,6 +356,7 @@ impl<'a> RtfWriter<'a> {
                 _ => out.push_str("\\page "),
             },
             Inline::ColumnBreak => out.push_str("\\column "),
+            Inline::TextBox(_) => {}
             Inline::Bookmark(n) => {
                 out.push_str("{\\*\\bkmkstart ");
                 rtf_text(out, n);
@@ -2320,7 +2321,7 @@ impl RtfReader {
         // Emit in the enclosing destination.
         let saved = self.st().dest;
         self.st().dest = Dest::Normal;
-        self.inline(Inline::Image(Image { data, width: w, height: h, alt: String::new() }));
+        self.inline(Inline::Image(Image { data, width: w, height: h, alt: String::new(), float: None }));
         self.st().dest = saved;
     }
 }

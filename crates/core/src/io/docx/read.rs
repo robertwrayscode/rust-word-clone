@@ -1048,7 +1048,7 @@ impl<'a> Reader<'a> {
             if let Some(id) = blip.attr("r:embed") {
                 if let Some(data) = self.load_image(id) {
                     let (w, h) = if cx > 0.0 && cy > 0.0 { (cx, cy) } else { natural_size(&data, 468.0) };
-                    return Some(Inline::Image(Image { data, width: w, height: h, alt }));
+                    return Some(Inline::Image(Image { data, width: w, height: h, alt, float: None }));
                 }
             }
         }
@@ -1099,7 +1099,7 @@ impl<'a> Reader<'a> {
             }
             let (nw, nh) = natural_size(&data, 468.0);
             let alt = shape.and_then(|s| s.attr("alt")).or_else(|| img.attr("o:title")).unwrap_or("").to_string();
-            return Some(Inline::Image(Image { data, width: w.unwrap_or(nw), height: h.unwrap_or(nh), alt }));
+            return Some(Inline::Image(Image { data, width: w.unwrap_or(nw), height: h.unwrap_or(nh), alt, float: None }));
         }
         if let Some(tb) = el.find("w:txbxContent") {
             self.textbox(tb);

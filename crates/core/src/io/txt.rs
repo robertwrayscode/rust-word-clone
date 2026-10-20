@@ -98,7 +98,7 @@ fn para_text(p: &Paragraph, out: &mut String) {
                 Field::Date(pic) => out.push_str(&crate::io::util::format_date_now(pic)),
                 Field::Other { result, .. } => out.push_str(result),
             },
-            Inline::Image(_) | Inline::Bookmark(_) | Inline::FootnoteRef(_) | Inline::EndnoteRef(_) => {}
+            Inline::Image(_) | Inline::TextBox(_) | Inline::Bookmark(_) | Inline::FootnoteRef(_) | Inline::EndnoteRef(_) => {}
         }
     }
 }

@@ -325,6 +325,110 @@ pub struct Image {
     pub height: f32,
     /// Alternative text.
     pub alt: String,
+    /// Floating placement; `None` = in line with text.
+    pub float: Option<Float>,
+}
+
+/// How text flows around a floating object (Word's "Wrap Text").
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub enum WrapMode {
+    /// Text flows around the object's bounding box.
+    #[default]
+    Square,
+    /// Like Square (we do not trace image outlines).
+    Tight,
+    /// Text stops above and resumes below the object.
+    TopBottom,
+    /// Object drawn behind the text; text ignores it.
+    Behind,
+    /// Object drawn in front of the text; text ignores it.
+    InFront,
+}
+
+/// What a floating object's horizontal offset is measured from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub enum HRel {
+    Page,
+    Margin,
+    #[default]
+    Column,
+    /// The anchor character's position on its line.
+    Character,
+}
+
+/// What a floating object's vertical offset is measured from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub enum VRel {
+    Page,
+    Margin,
+    /// Top of the anchor paragraph.
+    #[default]
+    Paragraph,
+    /// Top of the anchor line.
+    Line,
+}
+
+/// Alignment used instead of an offset (Word's "Alignment ... relative to").
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FloatAlign {
+    Start,
+    Center,
+    End,
+}
+
+/// Placement of a floating picture or text box. Offsets are in points.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Float {
+    pub wrap: WrapMode,
+    pub h_rel: HRel,
+    pub v_rel: VRel,
+    /// Horizontal offset from `h_rel` (ignored when `h_align` is set).
+    pub x: f32,
+    /// Vertical offset from `v_rel` (ignored when `v_align` is set).
+    pub y: f32,
+    pub h_align: Option<FloatAlign>,
+    pub v_align: Option<FloatAlign>,
+    /// Gap kept between the object and wrapped text, points.
+    pub dist: f32,
+}
+
+impl Default for Float {
+    fn default() -> Self {
+        Float { wrap: WrapMode::Square, h_rel: HRel::Column, v_rel: VRel::Paragraph, x: 0.0, y: 0.0, h_align: None, v_align: None, dist: 9.0 }
+    }
+}
+
+/// A text box: paragraphs inside a (usually floating) rectangle.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextBox {
+    pub paragraphs: Vec<Paragraph>,
+    /// Outer size in points.
+    pub width: f32,
+    pub height: f32,
+    /// Floating placement; `None` = in line with text.
+    pub float: Option<Float>,
+    pub fill: Option<Color>,
+    /// Outline; `None` = no line.
+    pub border: Option<Border>,
+    /// Inner margin, points.
+    pub padding: f32,
+    /// Grow the box height to fit its text.
+    pub auto_height: bool,
+}
+
+impl Default for TextBox {
+    fn default() -> Self {
+        TextBox {
+            paragraphs: vec![Paragraph::new()],
+            width: 144.0,
+            height: 72.0,
+            float: Some(Float::default()),
+            fill: Some(Color::WHITE),
+            border: Some(Border { style: BorderStyle::Single, width: 0.75, color: Color::BLACK, space: 0.0 }),
+            padding: 7.2,
+            auto_height: false,
+        }
+    }
 }
 
 /// A field whose displayed text is computed during layout.
@@ -354,6 +458,8 @@ pub enum Inline {
     EndnoteRef(u32),
     /// A bookmark anchor (zero visible width, still one char long).
     Bookmark(String),
+    /// A text box (inline or floating).
+    TextBox(Box<TextBox>),
 }
 
 impl Inline {
@@ -408,6 +514,10 @@ pub struct Paragraph {
     pub props: ParaProps,
     /// Formatting for the paragraph mark (used for empty paragraphs and new typing).
     pub mark: CharProps,
+    /// Set when this paragraph ends a section (Word's section break): the section's
+    /// page setup and headers. The last section of the document uses `Document::page`
+    /// and `Document::headers`.
+    pub section: Option<Box<Section>>,
 }
 
 impl Paragraph {
@@ -640,6 +750,35 @@ pub struct PageSetup {
     pub page_borders: Option<Borders>,
     /// Diagonal text watermark (Design > Watermark).
     pub watermark: Option<String>,
+    /// How this section starts relative to the previous one.
+    pub start: SectionStart,
+}
+
+/// Kind of section break that starts a section.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub enum SectionStart {
+    #[default]
+    NextPage,
+    Continuous,
+    EvenPage,
+    OddPage,
+}
+
+/// A document section other than the last one (see [`Paragraph::section`]).
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct Section {
+    pub page: PageSetup,
+    /// `None` = same as the previous section ("Link to Previous").
+    pub headers: Option<HeadersFooters>,
+}
+
+/// One header/footer slot of a section.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum HfKind {
+    Header,
+    Footer,
+    FirstHeader,
+    FirstFooter,
 }
 
 impl Default for PageSetup {
@@ -660,6 +799,7 @@ impl Default for PageSetup {
             page_color: None,
             page_borders: None,
             watermark: None,
+            start: SectionStart::NextPage,
         }
     }
 }
@@ -837,7 +977,7 @@ pub struct DocProperties {
     pub modified: String,
 }
 
-/// Header/footer content for a document (one set; Word's per-section headers are flattened).
+/// Header/footer content of a section.
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct HeadersFooters {
     pub header: Vec<Block>,
@@ -845,6 +985,25 @@ pub struct HeadersFooters {
     /// Used on the first page when `PageSetup::title_page` is set.
     pub first_header: Vec<Block>,
     pub first_footer: Vec<Block>,
+}
+
+impl HeadersFooters {
+    pub fn part(&self, kind: HfKind) -> &Vec<Block> {
+        match kind {
+            HfKind::Header => &self.header,
+            HfKind::Footer => &self.footer,
+            HfKind::FirstHeader => &self.first_header,
+            HfKind::FirstFooter => &self.first_footer,
+        }
+    }
+    pub fn part_mut(&mut self, kind: HfKind) -> &mut Vec<Block> {
+        match kind {
+            HfKind::Header => &mut self.header,
+            HfKind::Footer => &mut self.footer,
+            HfKind::FirstHeader => &mut self.first_header,
+            HfKind::FirstFooter => &mut self.first_footer,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -967,6 +1126,13 @@ impl Document {
             Story::Footer => &self.headers.footer,
             Story::FirstHeader => &self.headers.first_header,
             Story::FirstFooter => &self.headers.first_footer,
+            Story::SectionPart(i, kind) => {
+                static EMPTY: Vec<Block> = Vec::new();
+                match self.sections().get(i as usize).and_then(|s| s.headers.as_ref()) {
+                    Some(h) => h.part(kind),
+                    None => &EMPTY,
+                }
+            }
         }
     }
 
@@ -977,6 +1143,98 @@ impl Document {
             Story::Footer => &mut self.headers.footer,
             Story::FirstHeader => &mut self.headers.first_header,
             Story::FirstFooter => &mut self.headers.first_footer,
+            Story::SectionPart(i, kind) => {
+                let mut n = 0u16;
+                let mut found = None;
+                for (bi, b) in self.body.iter().enumerate() {
+                    if let Block::Para(p) = b {
+                        if p.section.is_some() {
+                            if n == i {
+                                found = Some(bi);
+                                break;
+                            }
+                            n += 1;
+                        }
+                    }
+                }
+                match found {
+                    Some(bi) => match &mut self.body[bi] {
+                        Block::Para(p) => p.section.as_mut().unwrap().headers.get_or_insert_with(Default::default).part_mut(kind),
+                        _ => unreachable!(),
+                    },
+                    // Unknown section: fall back to the last section's slot.
+                    None => self.headers.part_mut(kind),
+                }
+            }
+        }
+    }
+
+    /// Sections other than the last, in document order (top-level body paragraphs only).
+    pub fn sections(&self) -> Vec<&Section> {
+        self.body
+            .iter()
+            .filter_map(|b| match b {
+                Block::Para(p) => p.section.as_deref(),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Number of sections, including the last one.
+    pub fn section_count(&self) -> usize {
+        self.sections().len() + 1
+    }
+
+    /// Section index (0-based) of every body block. Blocks after the last section
+    /// break belong to section `sections().len()` (the last section).
+    pub fn block_sections(&self) -> Vec<usize> {
+        let mut out = Vec::with_capacity(self.body.len());
+        let mut cur = 0;
+        for b in &self.body {
+            out.push(cur);
+            if let Block::Para(p) = b {
+                if p.section.is_some() {
+                    cur += 1;
+                }
+            }
+        }
+        out
+    }
+
+    /// Page setup of section `i` (the last section is `Document::page`).
+    pub fn section_page(&self, i: usize) -> &PageSetup {
+        self.sections().get(i).map(|s| &s.page).unwrap_or(&self.page)
+    }
+
+    /// Which stored header/footer set section `i` uses: `Some(j)` = section j's own
+    /// headers, `None` = the last section's (`Document::headers`). A section without
+    /// its own headers uses the nearest earlier section that has them, else the last section's.
+    pub fn headers_owner(&self, i: usize) -> Option<usize> {
+        let secs = self.sections();
+        if i >= secs.len() {
+            return None;
+        }
+        (0..=i).rev().find(|&j| secs[j].headers.is_some())
+    }
+
+    /// Headers and footers shown in section `i`.
+    pub fn section_headers(&self, i: usize) -> &HeadersFooters {
+        match self.headers_owner(i) {
+            Some(j) => self.sections()[j].headers.as_ref().unwrap(),
+            None => &self.headers,
+        }
+    }
+
+    /// The story used to edit header/footer `kind` of section `i`.
+    pub fn header_story(&self, i: usize, kind: HfKind) -> Story {
+        match self.headers_owner(i) {
+            Some(j) => Story::SectionPart(j as u16, kind),
+            None => match kind {
+                HfKind::Header => Story::Header,
+                HfKind::Footer => Story::Footer,
+                HfKind::FirstHeader => Story::FirstHeader,
+                HfKind::FirstFooter => Story::FirstFooter,
+            },
         }
     }
 
@@ -1014,4 +1272,8 @@ pub enum Story {
     Footer,
     FirstHeader,
     FirstFooter,
+    /// Header/footer of an earlier section: (index of the section among
+    /// [`Document::sections`], which part). Only valid when that section
+    /// has its own headers.
+    SectionPart(u16, HfKind),
 }

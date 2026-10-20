@@ -437,6 +437,7 @@ impl<'a> HtmlWriter<'a> {
                 out.push_str("<br style=\"page-break-before:always;clear:both\">");
                 return;
             }
+            Inline::TextBox(_) => return,
             Inline::Image(img) => {
                 *at_start = false;
                 let mime = image_mime(&img.data.format);
@@ -2305,7 +2306,7 @@ impl<'d> HtmlReader<'d> {
             (None, Some(h)) => (nw * h / nh, h),
             (None, None) => (nw, nh),
         };
-        let img = Image { data, width: round2(w), height: round2(h), alt };
+        let img = Image { data, width: round2(w), height: round2(h), alt, float: None };
         self.push_inline(c, Inline::Image(img));
         self.last_space = false;
     }

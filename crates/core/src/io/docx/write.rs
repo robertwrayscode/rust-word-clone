@@ -820,6 +820,7 @@ impl<'a> Writer<'a> {
         let props = CharProps { link: None, revision: None, comments: Vec::new(), ..run.props.clone() };
         let rp = rpr(&props);
         match &run.content {
+            Inline::TextBox(_) => {}
             Inline::Bookmark(name) => {
                 self.bookmark_id += 1;
                 let _ = write!(

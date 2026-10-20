@@ -448,6 +448,7 @@ impl<'a> MdWriter<'a> {
                     set_flags(&mut out, &mut open, Flags::default(), &mut pending_ws);
                     out.push_str("\\\n");
                 }
+                Inline::TextBox(_) => {}
                 Inline::Image(img) => {
                     set_flags(&mut out, &mut open, Flags::default(), &mut pending_ws);
                     let _ = write!(out, "![{}](data:{};base64,{})", esc_text(&img.alt, table), image_mime(&img.data.format), base64_encode(&img.data.bytes));
@@ -1594,7 +1595,7 @@ fn make_image(alt: &str, target: &str) -> Option<Image> {
     let data = image_data(bytes);
     data.pixel_size?;
     let (w, h) = natural_size(&data, 468.0);
-    Some(Image { data, width: w, height: h, alt: alt.to_string() })
+    Some(Image { data, width: w, height: h, alt: alt.to_string(), float: None })
 }
 
 /// Paragraphs for a code block: one per line, monospace, no spacing.

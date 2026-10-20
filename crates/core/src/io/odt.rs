@@ -959,6 +959,7 @@ impl<'a> OdtWriter<'a> {
             Inline::Tab => out.push_str("<text:tab/>"),
             Inline::LineBreak => out.push_str("<text:line-break/>"),
             Inline::PageBreak | Inline::ColumnBreak => {}
+            Inline::TextBox(_) => {}
             Inline::Bookmark(n) => {
                 let _ = write!(out, r#"<text:bookmark text:name="{}"/>"#, esc_attr(n));
             }
@@ -1957,7 +1958,7 @@ impl<'a> OdtReader<'a> {
                         let w = attr_len(e, "svg:width").unwrap_or(nw);
                         let h = attr_len(e, "svg:height").unwrap_or(nh);
                         let alt = e.child("svg:desc").or_else(|| e.child("svg:title")).map(|d| d.text()).unwrap_or_default();
-                        self.push(out, Inline::Image(Image { data, width: w, height: h, alt }), props);
+                        self.push(out, Inline::Image(Image { data, width: w, height: h, alt, float: None }), props);
                         solid(ws);
                     }
                 } else if let Some(tb) = e.child("draw:text-box") {

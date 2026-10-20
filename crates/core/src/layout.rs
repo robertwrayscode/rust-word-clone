@@ -333,6 +333,7 @@ fn build_pieces(cx: &Ctx, para: &Paragraph, rp: &ResolvedPara, fc: FieldCtx) -> 
             Inline::LineBreak => pieces.push(mk(PieceKind::LineBreak, face_id, rc.size, 0.0)),
             Inline::PageBreak => pieces.push(mk(PieceKind::PageBreak, face_id, rc.size, 0.0)),
             Inline::ColumnBreak => pieces.push(mk(PieceKind::ColumnBreak, face_id, rc.size, 0.0)),
+            Inline::TextBox(_) => pieces.push(mk(PieceKind::Zero, face_id, rc.size, 0.0)),
             Inline::Bookmark(_) => {
                 let mut p = mk(PieceKind::Zero, face_id, rc.size, 0.0);
                 p.ascent = 0.0;
