@@ -93,7 +93,7 @@ pub struct CommentMark {
     pub y: f32,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Page {
     pub index: usize,
     /// Displayed page number.
@@ -106,6 +106,33 @@ pub struct Page {
     pub body_top: f32,
     pub body_bottom: f32,
     pub comment_marks: Vec<CommentMark>,
+    /// Index of the document section this page belongs to (the section the page
+    /// starts in; see [`Document::sections`]).
+    pub section: usize,
+    /// Story of the header shown on this page (the one that would be used even
+    /// when it is empty), so the app can edit it.
+    pub header_story: Option<Story>,
+    /// Story of the footer shown on this page.
+    pub footer_story: Option<Story>,
+    /// Floating pictures and text boxes placed on this page (body, table cells,
+    /// headers and footers), in placement order. Inline text boxes are not listed.
+    pub floats: Vec<FloatBox>,
+}
+
+/// A floating picture or text box placed on a page (page coordinates, points).
+#[derive(Clone, Debug, PartialEq)]
+pub struct FloatBox {
+    /// Paragraph holding the anchor character.
+    pub path: ParaPath,
+    /// Char offset of the image / text box inline in that paragraph.
+    pub offset: usize,
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub wrap: WrapMode,
+    /// True for a text box, false for a picture.
+    pub text_box: bool,
 }
 
 /// A heading found during layout (navigation pane, table of contents).
@@ -161,6 +188,35 @@ enum PieceKind {
     /// Unbreakable text box (fields, note references).
     Boxed(String),
     Zero,
+    /// Anchor of a floating object: index into `ParaLines::floats`. Zero width.
+    Float(usize),
+    /// Inline text box: index into `ParaLines::boxes`.
+    InlineBox(usize),
+}
+
+/// Content of a floating object.
+#[derive(Clone, Debug)]
+enum FloatContent {
+    Image(Arc<ImageData>),
+    TextBox(Box<TextBox>),
+}
+
+/// A floating object found in a paragraph.
+#[derive(Clone, Debug)]
+struct FloatItem {
+    /// Piece index (= char offset) of the anchor.
+    piece: usize,
+    float: Float,
+    w: f32,
+    h: f32,
+    content: FloatContent,
+}
+
+impl FloatItem {
+    /// Positioned relative to its line (needs the line to be placed first).
+    fn deferred(&self) -> bool {
+        self.float.v_rel == VRel::Line || self.float.h_rel == HRel::Character
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -199,6 +255,17 @@ struct ParaLines {
     label: Option<(String, f32, FaceId, f32, Color)>,
     /// Footnote/endnote ids referenced, by piece index.
     note_refs: Vec<(usize, u32)>,
+    /// Floating objects anchored in this paragraph.
+    floats: Vec<FloatItem>,
+    /// Inline text boxes.
+    boxes: Vec<TextBox>,
+    /// End x of the list label (first line), if any.
+    label_end: Option<f32>,
+    /// Paragraph mark metrics: ascent, descent, line height.
+    mark: (f32, f32, f32),
+    /// Width the paragraph was prepared for (column / cell width).
+    width: f32,
+    fc: FieldCtx,
 }
 
 #[derive(Clone, Debug)]
@@ -272,12 +339,22 @@ struct Ctx<'a> {
     endnote_numbers: &'a HashMap<u32, u32>,
 }
 
-fn build_pieces(cx: &Ctx, para: &Paragraph, rp: &ResolvedPara, fc: FieldCtx) -> (Vec<Piece>, Vec<ResolvedChars>, Vec<(usize, u32)>) {
+struct Built {
+    pieces: Vec<Piece>,
+    styles: Vec<ResolvedChars>,
+    note_refs: Vec<(usize, u32)>,
+    floats: Vec<FloatItem>,
+    boxes: Vec<TextBox>,
+}
+
+fn build_pieces(cx: &Ctx, para: &Paragraph, rp: &ResolvedPara, fc: FieldCtx) -> Built {
     let doc = cx.doc;
     let db = cx.db;
     let mut pieces = Vec::with_capacity(para.len() + 1);
     let mut styles: Vec<ResolvedChars> = Vec::new();
     let mut note_refs = Vec::new();
+    let mut floats: Vec<FloatItem> = Vec::new();
+    let mut boxes: Vec<TextBox> = Vec::new();
     for run in &para.runs {
         let mut rc = resolve_chars(doc, &rp.style, &run.props);
         if matches!(run.content, Inline::FootnoteRef(_) | Inline::EndnoteRef(_)) && run.props.vert_align.is_none() {
@@ -333,7 +410,46 @@ fn build_pieces(cx: &Ctx, para: &Paragraph, rp: &ResolvedPara, fc: FieldCtx) -> 
             Inline::LineBreak => pieces.push(mk(PieceKind::LineBreak, face_id, rc.size, 0.0)),
             Inline::PageBreak => pieces.push(mk(PieceKind::PageBreak, face_id, rc.size, 0.0)),
             Inline::ColumnBreak => pieces.push(mk(PieceKind::ColumnBreak, face_id, rc.size, 0.0)),
-            Inline::TextBox(_) => pieces.push(mk(PieceKind::Zero, face_id, rc.size, 0.0)),
+            Inline::TextBox(tb) => {
+                let h = textbox_height(cx, tb, fc);
+                match tb.float {
+                    Some(f) => {
+                        let kind = if hidden {
+                            PieceKind::Zero
+                        } else {
+                            floats.push(FloatItem { piece: pieces.len(), float: f, w: tb.width.max(1.0), h, content: FloatContent::TextBox(tb.clone()) });
+                            PieceKind::Float(floats.len() - 1)
+                        };
+                        let mut p = mk(kind, face_id, rc.size, 0.0);
+                        p.ascent = 0.0;
+                        p.descent = 0.0;
+                        p.line_height = 0.0;
+                        pieces.push(p);
+                    }
+                    None => {
+                        boxes.push((**tb).clone());
+                        let mut p = mk(PieceKind::InlineBox(boxes.len() - 1), face_id, rc.size, tb.width.max(1.0));
+                        p.ascent = h;
+                        p.descent = 0.0;
+                        p.image_h = h;
+                        p.line_height = h;
+                        pieces.push(p);
+                    }
+                }
+            }
+            Inline::Image(img) if img.float.is_some() => {
+                let kind = if hidden {
+                    PieceKind::Zero
+                } else {
+                    floats.push(FloatItem { piece: pieces.len(), float: img.float.unwrap(), w: img.width.max(1.0), h: img.height.max(1.0), content: FloatContent::Image(img.data.clone()) });
+                    PieceKind::Float(floats.len() - 1)
+                };
+                let mut p = mk(kind, face_id, rc.size, 0.0);
+                p.ascent = 0.0;
+                p.descent = 0.0;
+                p.line_height = 0.0;
+                pieces.push(p);
+            }
             Inline::Bookmark(_) => {
                 let mut p = mk(PieceKind::Zero, face_id, rc.size, 0.0);
                 p.ascent = 0.0;
@@ -371,7 +487,7 @@ fn build_pieces(cx: &Ctx, para: &Paragraph, rp: &ResolvedPara, fc: FieldCtx) -> 
             }
         }
     }
-    (pieces, styles, note_refs)
+    Built { pieces, styles, note_refs, floats, boxes }
 }
 
 fn is_cjk(c: char) -> bool {
@@ -403,15 +519,24 @@ fn next_tab(rp: &ResolvedPara, default_tab: f32, x: f32, first_line: bool) -> (f
 }
 
 fn layout_paragraph(cx: &Ctx, para: &Paragraph, width: f32, fc: FieldCtx, counter: &mut ListCounter) -> ParaLines {
+    let mut pl = prepare_paragraph(cx, para, width, fc, counter);
+    while let Some(l) = next_line(cx, &mut pl, 0.0, width) {
+        pl.lines.push(l);
+    }
+    pl
+}
+
+/// Build the pieces, styles and list label of a paragraph; no lines yet.
+fn prepare_paragraph(cx: &Ctx, para: &Paragraph, width: f32, fc: FieldCtx, counter: &mut ListCounter) -> ParaLines {
     let doc = cx.doc;
     let db = cx.db;
     let rp = resolve_para(doc, &para.props);
-    let (mut pieces, mut styles, note_refs) = build_pieces(cx, para, &rp, fc);
+    let Built { pieces, mut styles, note_refs, floats, boxes } = build_pieces(cx, para, &rp, fc);
     // Paragraph mark metrics (empty paragraphs and line height floor).
     let mark_rc = resolve_chars(doc, &rp.style, &if para.runs.is_empty() { para.mark.clone() } else { para.runs.last().map(|r| r.props.clone()).unwrap_or_default() });
     let mark_face = db.face_for(&mark_rc.font, mark_rc.bold, mark_rc.italic);
     let mf = db.face(mark_face);
-    let (mark_asc, mark_desc, mark_lh) = (mf.ascent * mark_rc.size, mf.descent * mark_rc.size, mf.line_height() * mark_rc.size);
+    let mark = (mf.ascent * mark_rc.size, mf.descent * mark_rc.size, mf.line_height() * mark_rc.size);
     styles.push(mark_rc.clone());
 
     // List label.
@@ -437,212 +562,26 @@ fn layout_paragraph(cx: &Ctx, para: &Paragraph, width: f32, fc: FieldCtx, counte
             }
         }
     }
+    ParaLines { lines: Vec::new(), pieces, styles, rp, label, note_refs, floats, boxes, label_end, mark, width, fc }
+}
 
-    let avail_right = width - rp.indent_right;
-    let mut lines: Vec<PLine> = Vec::new();
-    let n = pieces.len();
-    let mut i = 0;
-    let mut first = true;
-    loop {
-        let left = rp.indent_left + if first { rp.indent_first } else { 0.0 };
-        let mut x = left;
-        if first {
-            if let Some(le) = label_end {
-                // Number followed by a tab to the text position.
-                let (pos, _, _) = next_tab(&rp, doc.settings.default_tab, le, true);
-                x = if le < rp.indent_left - 0.01 { rp.indent_left } else { pos };
-            }
-        }
-        let line_start = i;
-        let mut xs: Vec<f32> = Vec::new();
-        let mut last_break: Option<usize> = None; // piece index after which we can break
-        let mut brk = None;
-        let mut j = i;
-        let mut overflow_at: Option<usize> = None;
-        while j < n {
-            let k = pieces[j].kind.clone();
-            match k {
-                PieceKind::LineBreak | PieceKind::PageBreak | PieceKind::ColumnBreak => {
-                    xs.push(x);
-                    j += 1;
-                    brk = Some(k);
-                    break;
-                }
-                PieceKind::Tab => {
-                    let st = &styles[pieces[j].style];
-                    let _ = st;
-                    let (pos, align, leader) = next_tab(&rp, doc.settings.default_tab, x, first);
-                    // width of following segment for right/center/decimal tabs
-                    let mut seg = 0.0;
-                    let mut dec = None;
-                    let mut q = j + 1;
-                    while q < n && !matches!(pieces[q].kind, PieceKind::Tab | PieceKind::LineBreak | PieceKind::PageBreak | PieceKind::ColumnBreak) {
-                        if dec.is_none() && matches!(pieces[q].kind, PieceKind::Char('.') | PieceKind::Char(',')) {
-                            dec = Some(seg);
-                        }
-                        seg += pieces[q].width;
-                        q += 1;
-                    }
-                    let target = match align {
-                        TabAlign::Right => pos - seg,
-                        TabAlign::Center => pos - seg / 2.0,
-                        TabAlign::Decimal => pos - dec.unwrap_or(seg),
-                        _ => pos,
-                    };
-                    let w = if target > x { target - x } else if align == TabAlign::Left { pos - x } else { 0.0 };
-                    pieces[j].width = if pieces[j].hidden { 0.0 } else { w.max(0.0) };
-                    pieces[j].leader = leader;
-                    if x + pieces[j].width > avail_right + 0.01 && j > i {
-                        overflow_at = Some(j);
-                        break;
-                    }
-                    xs.push(x);
-                    x += pieces[j].width;
-                    last_break = Some(j);
-                    j += 1;
-                }
-                PieceKind::Space => {
-                    xs.push(x);
-                    x += pieces[j].width;
-                    last_break = Some(j);
-                    j += 1;
-                }
-                _ => {
-                    let w = pieces[j].width;
-                    if x + w > avail_right + 0.01 && j > i {
-                        overflow_at = Some(j);
-                        break;
-                    }
-                    xs.push(x);
-                    x += w;
-                    let c = match pieces[j].kind {
-                        PieceKind::Char(c) => Some(c),
-                        _ => None,
-                    };
-                    if let Some(c) = c {
-                        let next_is_letter = matches!(pieces.get(j + 1).map(|p| &p.kind), Some(PieceKind::Char(n)) if n.is_alphanumeric());
-                        if (c == '-' || c == '\u{2013}' || c == '\u{2014}' || c == '/') && next_is_letter || is_cjk(c) {
-                            last_break = Some(j);
-                        }
-                        if matches!(pieces.get(j + 1).map(|p| &p.kind), Some(PieceKind::Char(n)) if is_cjk(*n)) {
-                            last_break = Some(j);
-                        }
-                    }
-                    if matches!(pieces[j].kind, PieceKind::Image(_)) {
-                        last_break = Some(j);
-                    }
-                    j += 1;
-                }
-            }
-        }
-        let mut end = j;
-        if let Some(o) = overflow_at {
-            match last_break {
-                Some(b) if b >= i => {
-                    end = b + 1;
-                }
-                _ => end = o.max(i + 1),
-            }
-            // Hang trailing spaces: include following spaces in this line.
-            while end < n && pieces[end].kind == PieceKind::Space {
-                end += 1;
-            }
-            xs.truncate(end - line_start);
-            while xs.len() < end - line_start {
-                // spaces appended past the overflow: position after previous
-                let prev = xs.last().copied().unwrap_or(left);
-                let pw = pieces[line_start + xs.len() - 1].width;
-                xs.push(prev + pw);
-            }
-            brk = None;
-        }
-        // Visible end x (exclude trailing spaces and breaks).
-        let mut vis_end = end;
-        while vis_end > line_start && matches!(pieces[vis_end - 1].kind, PieceKind::Space | PieceKind::LineBreak | PieceKind::PageBreak | PieceKind::ColumnBreak) {
-            vis_end -= 1;
-        }
-        let end_x = if vis_end > line_start { xs[vis_end - 1 - line_start] + pieces[vis_end - 1].width } else { x.min(xs.first().copied().unwrap_or(x)) };
-        let is_last = end >= n && overflow_at.is_none();
-        // Line metrics.
-        let mut asc: f32 = 0.0;
-        let mut desc: f32 = 0.0;
-        let mut lh: f32 = 0.0;
-        for p in &pieces[line_start..end] {
-            if p.hidden {
-                continue;
-            }
-            asc = asc.max(p.ascent);
-            desc = desc.max(p.descent);
-            lh = lh.max(p.line_height);
-        }
-        if asc == 0.0 && desc == 0.0 {
-            asc = mark_asc;
-            desc = mark_desc;
-            lh = mark_lh;
-        }
-        if let Some((_, _, _, size, _)) = &label {
-            if first {
-                asc = asc.max(size * 0.9);
-            }
-        }
-        let natural = lh.max(asc + desc);
-        let (height, baseline) = match rp.line_spacing {
-            LineSpacing::Multiple(m) => {
-                let h = natural * m.max(0.1);
-                (h, h - desc - (natural - asc - desc).max(0.0) * 0.0 - (natural - asc - desc).max(0.0) / 2.0 * 0.0 - (lh - asc - desc).max(0.0) * 0.0)
-            }
-            LineSpacing::AtLeast(v) => {
-                let h = natural.max(v);
-                (h, h - desc)
-            }
-            LineSpacing::Exactly(v) => {
-                let h = v.max(1.0);
-                (h, (h - desc).max(h * 0.75))
-            }
-        };
-        // Alignment.
-        let content_w = end_x - left;
-        let avail = avail_right - left;
-        let mut shift = 0.0;
-        let mut justify = 0.0;
-        let ends_with_break = matches!(brk, Some(PieceKind::LineBreak));
-        match rp.align {
-            Align::Left => {}
-            Align::Center => shift = ((avail - content_w) / 2.0).max(0.0),
-            Align::Right => shift = (avail - content_w).max(0.0),
-            Align::Justify => {
-                if !is_last && !ends_with_break && brk.is_none() {
-                    // Spaces after the last tab, before visible end.
-                    let last_tab = (line_start..vis_end).rev().find(|&q| pieces[q].kind == PieceKind::Tab);
-                    let from = last_tab.map(|t| t + 1).unwrap_or(line_start);
-                    let spaces = (from..vis_end).filter(|&q| pieces[q].kind == PieceKind::Space).count();
-                    if spaces > 0 && avail > content_w {
-                        justify = (avail_right - end_x) / spaces as f32;
-                        let mut add = 0.0;
-                        for q in line_start..end {
-                            xs[q - line_start] += add;
-                            if q >= from && q < vis_end && pieces[q].kind == PieceKind::Space {
-                                add += justify;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        if shift > 0.0 {
-            for v in xs.iter_mut() {
-                *v += shift;
-            }
-        }
-        let end_x = if justify > 0.0 { avail_right } else { end_x + shift };
-        lines.push(PLine { a: line_start, b: end, xs, end_x, height, baseline, left, right: avail_right, brk: brk.clone(), last: is_last, justify });
-        first = false;
-        i = end;
-        if i >= n {
-            // A trailing line break needs an empty line after it.
-            if matches!(brk, Some(PieceKind::LineBreak)) {
-                let l = rp.indent_left;
-                lines.push(PLine {
+/// Break the next line of `pl` (after the lines already in `pl.lines`) within the
+/// horizontal interval [`lo`, `hi`] (relative to the column's left edge; the
+/// paragraph's indents still apply). Returns `None` when the paragraph is complete.
+/// Does not modify `pl.lines`.
+fn next_line(cx: &Ctx, pl: &mut ParaLines, lo: f32, hi: f32) -> Option<PLine> {
+    let doc = cx.doc;
+    let n = pl.pieces.len();
+    let (mark_asc, mark_desc, mark_lh) = pl.mark;
+    let ParaLines { lines, pieces, rp, label, label_end, width, .. } = pl;
+    let rp = &*rp;
+    let avail_right = (*width - rp.indent_right).min(hi);
+    if let Some(prev) = lines.last() {
+        if prev.b >= n {
+            if matches!(prev.brk, Some(PieceKind::LineBreak)) && prev.a < n {
+                // A trailing line break needs an empty line after it.
+                let l = rp.indent_left.max(lo);
+                return Some(PLine {
                     a: n,
                     b: n,
                     xs: vec![],
@@ -658,27 +597,203 @@ fn layout_paragraph(cx: &Ctx, para: &Paragraph, width: f32, fc: FieldCtx, counte
                     last: true,
                     justify: 0.0,
                 });
-            } else if let Some(l) = lines.last_mut() {
-                l.last = true;
             }
-            break;
+            return None;
         }
     }
-    if lines.is_empty() {
-        let l = rp.indent_left + rp.indent_first;
-        let (h, b) = match rp.line_spacing {
-            LineSpacing::Multiple(m) => (mark_lh * m, mark_lh * m - mark_desc),
-            LineSpacing::AtLeast(v) => (mark_lh.max(v), mark_lh.max(v) - mark_desc),
-            LineSpacing::Exactly(v) => (v, (v - mark_desc).max(v * 0.75)),
-        };
-        let x0 = match rp.align {
-            Align::Center => l + (avail_right - l) / 2.0,
-            Align::Right => avail_right,
-            _ => label_end.map(|le| if le < rp.indent_left { rp.indent_left } else { next_tab(&rp, doc.settings.default_tab, le, true).0 }).unwrap_or(l),
-        };
-        lines.push(PLine { a: 0, b: 0, xs: vec![], end_x: x0, height: h, baseline: b, left: l, right: avail_right, brk: None, last: true, justify: 0.0 });
+    let i = lines.last().map(|l| l.b).unwrap_or(0);
+    let first = lines.is_empty();
+    let left = (rp.indent_left + if first { rp.indent_first } else { 0.0 }).max(lo);
+    let mut x = left;
+    if first {
+        if let Some(le) = *label_end {
+            // Number followed by a tab to the text position.
+            let (pos, _, _) = next_tab(rp, doc.settings.default_tab, le, true);
+            x = if le < rp.indent_left - 0.01 { rp.indent_left } else { pos };
+            x = x.max(left);
+        }
     }
-    ParaLines { lines, pieces, styles, rp, label, note_refs }
+    let line_start = i;
+    let mut xs: Vec<f32> = Vec::new();
+    let mut last_break: Option<usize> = None; // piece index after which we can break
+    let mut brk = None;
+    let mut j = i;
+    let mut overflow_at: Option<usize> = None;
+    while j < n {
+        let k = pieces[j].kind.clone();
+        match k {
+            PieceKind::LineBreak | PieceKind::PageBreak | PieceKind::ColumnBreak => {
+                xs.push(x);
+                j += 1;
+                brk = Some(k);
+                break;
+            }
+            PieceKind::Tab => {
+                let (pos, align, leader) = next_tab(rp, doc.settings.default_tab, x, first);
+                // width of following segment for right/center/decimal tabs
+                let mut seg = 0.0;
+                let mut dec = None;
+                let mut q = j + 1;
+                while q < n && !matches!(pieces[q].kind, PieceKind::Tab | PieceKind::LineBreak | PieceKind::PageBreak | PieceKind::ColumnBreak) {
+                    if dec.is_none() && matches!(pieces[q].kind, PieceKind::Char('.') | PieceKind::Char(',')) {
+                        dec = Some(seg);
+                    }
+                    seg += pieces[q].width;
+                    q += 1;
+                }
+                let target = match align {
+                    TabAlign::Right => pos - seg,
+                    TabAlign::Center => pos - seg / 2.0,
+                    TabAlign::Decimal => pos - dec.unwrap_or(seg),
+                    _ => pos,
+                };
+                let w = if target > x { target - x } else if align == TabAlign::Left { pos - x } else { 0.0 };
+                pieces[j].width = if pieces[j].hidden { 0.0 } else { w.max(0.0) };
+                pieces[j].leader = leader;
+                if x + pieces[j].width > avail_right + 0.01 && j > i {
+                    overflow_at = Some(j);
+                    break;
+                }
+                xs.push(x);
+                x += pieces[j].width;
+                last_break = Some(j);
+                j += 1;
+            }
+            PieceKind::Space => {
+                xs.push(x);
+                x += pieces[j].width;
+                last_break = Some(j);
+                j += 1;
+            }
+            _ => {
+                let w = pieces[j].width;
+                if x + w > avail_right + 0.01 && j > i {
+                    overflow_at = Some(j);
+                    break;
+                }
+                xs.push(x);
+                x += w;
+                let c = match pieces[j].kind {
+                    PieceKind::Char(c) => Some(c),
+                    _ => None,
+                };
+                if let Some(c) = c {
+                    let next_is_letter = matches!(pieces.get(j + 1).map(|p| &p.kind), Some(PieceKind::Char(n)) if n.is_alphanumeric());
+                    if (c == '-' || c == '\u{2013}' || c == '\u{2014}' || c == '/') && next_is_letter || is_cjk(c) {
+                        last_break = Some(j);
+                    }
+                    if matches!(pieces.get(j + 1).map(|p| &p.kind), Some(PieceKind::Char(n)) if is_cjk(*n)) {
+                        last_break = Some(j);
+                    }
+                }
+                if matches!(pieces[j].kind, PieceKind::Image(_) | PieceKind::InlineBox(_)) {
+                    last_break = Some(j);
+                }
+                j += 1;
+            }
+        }
+    }
+    let mut end = j;
+    if let Some(o) = overflow_at {
+        match last_break {
+            Some(b) if b >= i => {
+                end = b + 1;
+            }
+            _ => end = o.max(i + 1),
+        }
+        // Hang trailing spaces: include following spaces in this line.
+        while end < n && pieces[end].kind == PieceKind::Space {
+            end += 1;
+        }
+        xs.truncate(end - line_start);
+        while xs.len() < end - line_start {
+            // spaces appended past the overflow: position after previous
+            let prev = xs.last().copied().unwrap_or(left);
+            let pw = pieces[line_start + xs.len() - 1].width;
+            xs.push(prev + pw);
+        }
+        brk = None;
+    }
+    // Visible end x (exclude trailing spaces and breaks).
+    let mut vis_end = end;
+    while vis_end > line_start && matches!(pieces[vis_end - 1].kind, PieceKind::Space | PieceKind::LineBreak | PieceKind::PageBreak | PieceKind::ColumnBreak) {
+        vis_end -= 1;
+    }
+    let end_x = if vis_end > line_start { xs[vis_end - 1 - line_start] + pieces[vis_end - 1].width } else { x.min(xs.first().copied().unwrap_or(x)) };
+    let is_last = end >= n && overflow_at.is_none();
+    // Line metrics.
+    let mut asc: f32 = 0.0;
+    let mut desc: f32 = 0.0;
+    let mut lh: f32 = 0.0;
+    for p in &pieces[line_start..end] {
+        if p.hidden {
+            continue;
+        }
+        asc = asc.max(p.ascent);
+        desc = desc.max(p.descent);
+        lh = lh.max(p.line_height);
+    }
+    if asc == 0.0 && desc == 0.0 {
+        asc = mark_asc;
+        desc = mark_desc;
+        lh = mark_lh;
+    }
+    if let Some((_, _, _, size, _)) = &label {
+        if first {
+            asc = asc.max(size * 0.9);
+        }
+    }
+    let natural = lh.max(asc + desc);
+    let (height, baseline) = match rp.line_spacing {
+        LineSpacing::Multiple(m) => {
+            let h = natural * m.max(0.1);
+            (h, h - desc)
+        }
+        LineSpacing::AtLeast(v) => {
+            let h = natural.max(v);
+            (h, h - desc)
+        }
+        LineSpacing::Exactly(v) => {
+            let h = v.max(1.0);
+            (h, (h - desc).max(h * 0.75))
+        }
+    };
+    // Alignment.
+    let content_w = end_x - left;
+    let avail = avail_right - left;
+    let mut shift = 0.0;
+    let mut justify = 0.0;
+    let ends_with_break = matches!(brk, Some(PieceKind::LineBreak));
+    match rp.align {
+        Align::Left => {}
+        Align::Center => shift = ((avail - content_w) / 2.0).max(0.0),
+        Align::Right => shift = (avail - content_w).max(0.0),
+        Align::Justify => {
+            if !is_last && !ends_with_break && brk.is_none() {
+                // Spaces after the last tab, before visible end.
+                let last_tab = (line_start..vis_end).rev().find(|&q| pieces[q].kind == PieceKind::Tab);
+                let from = last_tab.map(|t| t + 1).unwrap_or(line_start);
+                let spaces = (from..vis_end).filter(|&q| pieces[q].kind == PieceKind::Space).count();
+                if spaces > 0 && avail > content_w {
+                    justify = (avail_right - end_x) / spaces as f32;
+                    let mut add = 0.0;
+                    for q in line_start..end {
+                        xs[q - line_start] += add;
+                        if q >= from && q < vis_end && pieces[q].kind == PieceKind::Space {
+                            add += justify;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if shift > 0.0 {
+        for v in xs.iter_mut() {
+            *v += shift;
+        }
+    }
+    let end_x = if justify > 0.0 { avail_right } else { end_x + shift };
+    Some(PLine { a: line_start, b: end, xs, end_x, height, baseline, left, right: avail_right, brk, last: end >= n, justify })
 }
 
 /// Emit shapes and a [`Line`] for one laid-out line at the given origin.
@@ -812,6 +927,11 @@ fn emit_line(cx: &Ctx, pl: &ParaLines, li: usize, path: ParaPath, ox: f32, top: 
             PieceKind::Image(data) => {
                 let x = ox + line.xs[q - line.a];
                 page.shapes.push(Shape::Image { x, y: base_y - p.image_h, w: p.width, h: p.image_h, image: data.clone() });
+                q += 1;
+            }
+            PieceKind::InlineBox(k) => {
+                let x = ox + line.xs[q - line.a];
+                textbox_shapes(cx, &pl.boxes[*k], x, base_y - p.image_h, p.width, p.image_h, pl.fc, &mut page.shapes);
                 q += 1;
             }
             PieceKind::Tab => {
@@ -958,6 +1078,73 @@ fn emit_line(cx: &Ctx, pl: &ParaLines, li: usize, path: ParaPath, ox: f32, top: 
     });
 }
 
+/// Lay out the paragraphs of a text box at the given inner width.
+/// Returns each paragraph's lines with its space before/after, and the content height.
+fn textbox_content(cx: &Ctx, tb: &TextBox, width: f32, fc: FieldCtx) -> (Vec<(ParaLines, f32, f32)>, f32) {
+    let mut counter = ListCounter::default();
+    let np = tb.paragraphs.len();
+    let mut out = Vec::with_capacity(np);
+    let mut h = 0.0;
+    for (pi, p) in tb.paragraphs.iter().enumerate() {
+        let pl = layout_paragraph(cx, p, width, fc, &mut counter);
+        let sb = if pi == 0 { 0.0 } else { pl.rp.space_before };
+        let sa = if pi + 1 == np { 0.0 } else { pl.rp.space_after };
+        h += sb + pl.lines.iter().map(|l| l.height).sum::<f32>() + sa;
+        out.push((pl, sb, sa));
+    }
+    (out, h)
+}
+
+fn textbox_inner_width(tb: &TextBox) -> f32 {
+    (tb.width - 2.0 * tb.padding).max(6.0)
+}
+
+/// Outer height of a text box (grown to fit its text when `auto_height`).
+fn textbox_height(cx: &Ctx, tb: &TextBox, fc: FieldCtx) -> f32 {
+    if !tb.auto_height {
+        return tb.height.max(1.0);
+    }
+    let (_, h) = textbox_content(cx, tb, textbox_inner_width(tb), fc);
+    tb.height.max(h + 2.0 * tb.padding).max(1.0)
+}
+
+/// Draw a text box: fill, text (clipped to the box) and outline.
+#[allow(clippy::too_many_arguments)]
+fn textbox_shapes(cx: &Ctx, tb: &TextBox, x: f32, y: f32, w: f32, h: f32, fc: FieldCtx, out: &mut Vec<Shape>) {
+    if let Some(c) = tb.fill {
+        out.push(Shape::Rect { x, y, w, h, color: c });
+    }
+    let pad = tb.padding.max(0.0);
+    let inner = (w - 2.0 * pad).max(6.0);
+    let (paras, _) = textbox_content(cx, tb, inner, fc);
+    let mut scratch = Page::default();
+    let mut cy = y + pad;
+    let limit = y + h - pad + 0.5;
+    'outer: for (pi, (pl, sb, sa)) in paras.iter().enumerate() {
+        cy += sb;
+        let ob = offset_table_len(pl.pieces.len());
+        let path = ParaPath { story: Story::Body, block: usize::MAX - 2, cell: Some(CellRef { row: 0, col: 0, para: pi }) };
+        for li in 0..pl.lines.len() {
+            let lh = pl.lines[li].height;
+            if cy + lh > limit && !(pi == 0 && li == 0 && tb.auto_height) {
+                break 'outer;
+            }
+            emit_line(cx, pl, li, path, x + pad, cy, &mut scratch, li == 0, &ob);
+            cy += lh;
+        }
+        cy += sa;
+    }
+    out.append(&mut scratch.shapes);
+    if let Some(b) = &tb.border {
+        let mut p = Page::default();
+        border_line(&mut p, b, x, y, x + w, y);
+        border_line(&mut p, b, x, y + h, x + w, y + h);
+        border_line(&mut p, b, x, y, x, y + h);
+        border_line(&mut p, b, x + w, y, x + w, y + h);
+        out.append(&mut p.shapes);
+    }
+}
+
 /// A stable colour per revision author.
 pub fn revision_color(author: &str) -> Color {
     const COLORS: [Color; 6] = [
@@ -990,6 +1177,126 @@ fn border_line(page: &mut Page, b: &Border, x1: f32, y1: f32, x2: f32, y2: f32) 
 // Pagination
 // ---------------------------------------------------------------------------
 
+/// Page geometry of one section.
+#[derive(Clone)]
+struct SecGeo {
+    ps: PageSetup,
+    body_top: f32,
+    body_bottom: f32,
+    /// Stories of the header, footer, first-page header and first-page footer.
+    stories: [Story; 4],
+}
+
+/// A floating object placed on a page, with what to draw.
+#[derive(Clone, Debug)]
+struct FloatDraw {
+    fb: FloatBox,
+    dist: f32,
+    content: FloatContent,
+}
+
+/// Reference areas used to position a floating object.
+#[derive(Clone, Copy, Debug)]
+struct RefGeo {
+    page_w: f32,
+    page_h: f32,
+    ml: f32,
+    mr: f32,
+    mt: f32,
+    mb: f32,
+    col_x: f32,
+    col_w: f32,
+}
+
+impl RefGeo {
+    fn of(ps: &PageSetup, col_x: f32, col_w: f32) -> RefGeo {
+        RefGeo { page_w: ps.width, page_h: ps.height, ml: ps.margin_left, mr: ps.margin_right, mt: ps.margin_top, mb: ps.margin_bottom, col_x, col_w }
+    }
+}
+
+/// Top-left corner of a floating object. `line` is (top, height) of the anchor
+/// line and `anchor_x` the x of the anchor character (for line/character-relative
+/// placement). The result is clamped to the page.
+fn float_pos(it: &FloatItem, g: &RefGeo, para_top: f32, line: (f32, f32), anchor_x: f32) -> (f32, f32) {
+    let f = &it.float;
+    let (w, h) = (it.w, it.h);
+    let (rx, rw) = match f.h_rel {
+        HRel::Page => (0.0, g.page_w),
+        HRel::Margin => (g.ml, (g.page_w - g.ml - g.mr).max(0.0)),
+        HRel::Column => (g.col_x, g.col_w),
+        HRel::Character => (anchor_x, 0.0),
+    };
+    let x = match f.h_align {
+        Some(FloatAlign::Start) => rx,
+        Some(FloatAlign::Center) => rx + (rw - w) / 2.0,
+        Some(FloatAlign::End) => rx + rw - w,
+        None => rx + f.x,
+    };
+    let (ry, rh) = match f.v_rel {
+        VRel::Page => (0.0, g.page_h),
+        VRel::Margin => (g.mt, (g.page_h - g.mt - g.mb).max(0.0)),
+        VRel::Paragraph => (para_top, 0.0),
+        VRel::Line => line,
+    };
+    let y = match (f.v_align, f.v_rel) {
+        (_, VRel::Paragraph) | (None, _) => ry + f.y,
+        (Some(FloatAlign::Start), _) => ry,
+        (Some(FloatAlign::Center), _) => ry + (rh - h) / 2.0,
+        (Some(FloatAlign::End), _) => ry + rh - h,
+    };
+    let x = if x.is_finite() { x } else { 0.0 };
+    let y = if y.is_finite() { y } else { 0.0 };
+    (x.min(g.page_w - w).max(0.0), y.min(g.page_h - h).max(0.0))
+}
+
+/// (line top, line height, anchor x) of piece `piece` for a paragraph whose first
+/// line starts at `top0`, drawn at column origin `ox`.
+fn anchor_of(pl: &ParaLines, piece: usize, top0: f32, ox: f32) -> (f32, f32, f32) {
+    let mut top = top0;
+    for l in &pl.lines {
+        if piece >= l.a && piece < l.b {
+            return (top, l.height, ox + l.xs[piece - l.a]);
+        }
+        top += l.height;
+    }
+    let h = pl.lines.first().map(|l| l.height).unwrap_or(0.0);
+    (top0, h, ox + pl.lines.first().map(|l| l.left).unwrap_or(0.0))
+}
+
+fn wraps_text(w: WrapMode) -> bool {
+    matches!(w, WrapMode::Square | WrapMode::Tight | WrapMode::TopBottom)
+}
+
+fn float_draw(it: &FloatItem, path: ParaPath, x: f32, y: f32) -> FloatDraw {
+    FloatDraw {
+        fb: FloatBox { path, offset: it.piece, x, y, w: it.w, h: it.h, wrap: it.float.wrap, text_box: matches!(it.content, FloatContent::TextBox(_)) },
+        dist: it.float.dist.max(0.0),
+        content: it.content.clone(),
+    }
+}
+
+/// Floats of a paragraph laid out without wrapping (headers, footers, table cells):
+/// positions for all of them, given the paragraph's top and column origin.
+fn static_floats(pl: &ParaLines, path: ParaPath, g: &RefGeo, top: f32, ox: f32, out: &mut Vec<FloatDraw>) {
+    for it in &pl.floats {
+        let (lt, lh, ax) = anchor_of(pl, it.piece, top, ox);
+        let (x, y) = float_pos(it, g, top, (lt, lh), ax);
+        out.push(float_draw(it, path, x, y));
+    }
+}
+
+/// Narrowest usable gap beside a wrapped object; narrower lines move below it.
+const MIN_WRAP_WIDTH: f32 = 36.0;
+
+/// Result of checking a line band against the floating objects of a page.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Excl {
+    /// Text may use [a, b] (page x).
+    Free(f32, f32),
+    /// No room: retry from this y.
+    Push(f32),
+}
+
 struct Pager<'a> {
     cx: &'a Ctx<'a>,
     pages: Vec<Page>,
@@ -1007,38 +1314,73 @@ struct Pager<'a> {
     body_lines: usize,
     /// Footnote content laid out: id → (height, ParaLines list)
     note_cache: HashMap<u32, f32>,
+    /// Geometry of every section.
+    geos: Vec<SecGeo>,
+    /// Section of the content being placed.
+    sec: usize,
+    /// Per page: is it the first page of its section.
+    page_first: Vec<bool>,
+    /// Top of the current column region (below content before a continuous section break).
+    region_top: f32,
+    /// Lowest y reached in the current region (over all columns).
+    max_y: f32,
+    col_left: f32,
+    col_w: f32,
+    col_gap: f32,
+    ncols: u32,
+    /// Floating objects per page.
+    draws: Vec<Vec<FloatDraw>>,
 }
 
 impl<'a> Pager<'a> {
-    fn page_setup(&self) -> &PageSetup {
-        &self.cx.doc.page
+    fn set_columns(&mut self, ps: &PageSetup) {
+        self.col_left = ps.margin_left;
+        self.col_w = ps.column_width();
+        self.col_gap = ps.column_gap;
+        self.ncols = ps.columns.max(1);
     }
 
     fn col_x(&self) -> f32 {
-        let ps = self.page_setup();
-        ps.margin_left + self.col as f32 * (ps.column_width() + ps.column_gap)
+        self.col_left + self.col as f32 * (self.col_w + self.col_gap)
     }
 
     fn col_width(&self) -> f32 {
-        self.page_setup().column_width()
+        self.col_w
     }
 
     fn new_page(&mut self) {
-        let ps = self.page_setup().clone();
+        self.new_page_ex(false);
+    }
+
+    /// Start a page of the current section; `first` marks the section's first page.
+    fn new_page_ex(&mut self, first: bool) {
+        let g = &self.geos[self.sec];
         let index = self.pages.len();
+        let number = match self.pages.last() {
+            None => g.ps.page_number_start,
+            Some(_) if first && self.sec > 0 && g.ps.page_number_start != 1 => g.ps.page_number_start,
+            Some(p) => p.number + 1,
+        };
+        self.body_top = g.body_top;
+        self.body_bottom = g.body_bottom;
         self.pages.push(Page {
             index,
-            number: ps.page_number_start + index as u32,
-            width: ps.width,
-            height: ps.height,
-            shapes: Vec::new(),
-            lines: Vec::new(),
+            number,
+            width: g.ps.width,
+            height: g.ps.height,
             body_top: self.body_top,
             body_bottom: self.body_bottom,
-            comment_marks: Vec::new(),
+            section: self.sec,
+            ..Default::default()
         });
+        let ps = g.ps.clone();
+        self.set_columns(&ps);
+        self.page_first.push(first);
+        self.draws.push(Vec::new());
         self.col = 0;
         self.y = self.body_top;
+        self.region_top = self.body_top;
+        self.max_y = self.body_top;
         self.page_notes.clear();
         self.notes_height = 0.0;
         self.prev_para = None;
@@ -1046,11 +1388,55 @@ impl<'a> Pager<'a> {
 
     /// Move to the next column or page.
     fn next_frame(&mut self) {
-        if self.col + 1 < self.page_setup().columns.max(1) {
+        if self.col + 1 < self.ncols {
+            self.max_y = self.max_y.max(self.y);
             self.col += 1;
-            self.y = self.body_top;
+            self.y = self.region_top;
         } else {
             self.new_page();
+        }
+    }
+
+    /// Begin section `s` (the previous block ended a section).
+    fn start_section(&mut self, s: usize) {
+        let cur = self.pages.last().map(|p| p.section).unwrap_or(0);
+        let (new_w, new_h, nstart, restart_at) = {
+            let ps = &self.geos[s].ps;
+            (ps.width, ps.height, ps.start, ps.page_number_start)
+        };
+        let cur_ps = &self.geos[cur].ps;
+        let mut start = nstart;
+        if start == SectionStart::Continuous && ((new_w - cur_ps.width).abs() > 0.5 || (new_h - cur_ps.height).abs() > 0.5) {
+            // A different paper size needs a new page.
+            start = SectionStart::NextPage;
+        }
+        match start {
+            SectionStart::Continuous => {
+                let top = self.max_y.max(self.y);
+                self.sec = s;
+                let ps = self.geos[s].ps.clone();
+                self.set_columns(&ps);
+                self.col = 0;
+                self.region_top = top;
+                self.y = top;
+                self.max_y = top;
+            }
+            SectionStart::NextPage => {
+                self.sec = s;
+                self.new_page_ex(true);
+            }
+            SectionStart::OddPage | SectionStart::EvenPage => {
+                let restart = restart_at != 1;
+                let last = self.pages.last().map(|p| p.number).unwrap_or(0);
+                let num = if restart { restart_at } else { last + 1 };
+                let want_odd = start == SectionStart::OddPage;
+                if !restart && (num % 2 == 1) != want_odd {
+                    // Blank page (belongs to the previous section).
+                    self.new_page_ex(false);
+                }
+                self.sec = s;
+                self.new_page_ex(true);
+            }
         }
     }
 
@@ -1059,7 +1445,7 @@ impl<'a> Pager<'a> {
     }
 
     fn at_top(&self) -> bool {
-        (self.y - self.body_top).abs() < 0.01
+        (self.y - self.region_top).abs() < 0.01
     }
 
     fn page(&mut self) -> &mut Page {
@@ -1068,6 +1454,103 @@ impl<'a> Pager<'a> {
 
     fn fc(&self) -> FieldCtx {
         FieldCtx { page_number: self.pages.last().map(|p| p.number).unwrap_or(1), page_count: self.cx.opts.page_count_hint }
+    }
+
+    fn ref_geo(&self) -> RefGeo {
+        let sec = self.pages.last().map(|p| p.section).unwrap_or(0);
+        RefGeo::of(&self.geos[sec].ps, self.col_x(), self.col_w)
+    }
+
+    fn has_wrap(&self) -> bool {
+        self.draws.last().map(|d| d.iter().any(|f| wraps_text(f.fb.wrap))).unwrap_or(false)
+    }
+
+    /// Free horizontal interval within [left, right] for a line band [top, bottom)
+    /// on the current page.
+    fn free_interval(&self, top: f32, bottom: f32, left: f32, right: f32) -> Excl {
+        let Some(d) = self.draws.last() else { return Excl::Free(left, right) };
+        let mut push_tb: Option<f32> = None;
+        let mut sq_bottom = f32::MAX;
+        let mut ex: Vec<(f32, f32)> = Vec::new();
+        for f in d {
+            let fb = &f.fb;
+            if !wraps_text(fb.wrap) {
+                continue;
+            }
+            let (fx0, fy0, fx1, fy1) = (fb.x - f.dist, fb.y - f.dist, fb.x + fb.w + f.dist, fb.y + fb.h + f.dist);
+            if fy1 <= top + 0.01 || fy0 >= bottom - 0.01 || fx1 <= left + 0.01 || fx0 >= right - 0.01 {
+                continue;
+            }
+            if fb.wrap == WrapMode::TopBottom {
+                push_tb = Some(push_tb.map_or(fy1, |p: f32| p.min(fy1)));
+            } else {
+                ex.push((fx0.max(left), fx1.min(right)));
+                sq_bottom = sq_bottom.min(fy1);
+            }
+        }
+        if let Some(p) = push_tb {
+            return Excl::Push(p);
+        }
+        if ex.is_empty() {
+            return Excl::Free(left, right);
+        }
+        ex.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut best = (0.0f32, left, left);
+        let mut cur = left;
+        for &(a, b) in &ex {
+            if a - cur > best.0 {
+                best = (a - cur, cur, a);
+            }
+            cur = cur.max(b);
+        }
+        if right - cur > best.0 {
+            best = (right - cur, cur, right);
+        }
+        if best.0 >= MIN_WRAP_WIDTH.min(right - left) {
+            Excl::Free(best.1, best.2)
+        } else {
+            Excl::Push(sq_bottom)
+        }
+    }
+
+    /// Does any wrapping float narrow the band [top, bottom) of the column [left, right]?
+    fn band_blocked(&self, top: f32, bottom: f32, left: f32, right: f32) -> bool {
+        !matches!(self.free_interval(top, bottom, left, right), Excl::Free(a, b) if a <= left + 0.01 && b >= right - 0.01)
+    }
+
+    /// Break the next line of `pl` at y0 or below, avoiding wrapping floats.
+    /// Returns the line's top and the line, or `None` when the paragraph is complete.
+    #[allow(clippy::too_many_arguments)]
+    fn break_around(&self, pl: &mut ParaLines, y0: f32, est: f32, x0: f32, width: f32, fresh: bool) -> Option<(f32, PLine)> {
+        let cx = self.cx;
+        if !self.has_wrap() {
+            return next_line(cx, pl, 0.0, width).map(|l| (y0, l));
+        }
+        let mut y = y0;
+        let mut h = est.max(1.0);
+        for iter in 0..64 {
+            match self.free_interval(y, y + h, x0, x0 + width) {
+                Excl::Push(ny) => {
+                    let ny = ny.max(y + 0.5);
+                    if ny + h > self.bottom() {
+                        // No room left beside/below the objects on this page.
+                        if fresh {
+                            return next_line(cx, pl, 0.0, width).map(|l| (y0, l));
+                        }
+                        return next_line(cx, pl, 0.0, width).map(|l| (ny, l));
+                    }
+                    y = ny;
+                }
+                Excl::Free(a, b) => {
+                    let line = next_line(cx, pl, a - x0, b - x0)?;
+                    if line.height <= h + 0.01 || iter >= 8 {
+                        return Some((y, line));
+                    }
+                    h = line.height;
+                }
+            }
+        }
+        next_line(cx, pl, 0.0, width).map(|l| (y, l))
     }
 
     fn note_height(&mut self, id: u32) -> f32 {
@@ -1093,7 +1576,7 @@ impl<'a> Pager<'a> {
         let cx = self.cx;
         let width = self.col_width();
         let fc = self.fc();
-        let pl = layout_paragraph(cx, para, width, fc, &mut self.counter);
+        let mut pl = layout_paragraph(cx, para, width, fc, &mut self.counter);
         let rp = pl.rp.clone();
         let offset_base = offset_table(para);
         // Spacing with contextual suppression.
@@ -1137,20 +1620,51 @@ impl<'a> Pager<'a> {
                 self.next_frame();
             }
         }
-        if !self.at_top() {
-            self.y += before;
-        } else if self.pages.len() > 1 || self.col > 0 {
-            self.y += before; // Word keeps space before at top of page except after explicit breaks
-        } else {
-            self.y += before;
-        }
-        let x0 = self.col_x();
-        let para_top = self.y;
+        self.y += before;
         let mut seg_top = self.y;
-        let n = pl.lines.len();
         let mut li = 0;
         let mut first_on_page = true;
-        while li < n {
+        // Once a line had to be re-broken around a floating object, the rest of the
+        // paragraph is broken line by line.
+        let mut diverged = false;
+        let has_deferred = pl.floats.iter().any(|f| f.deferred());
+        let mut floats_pending = pl.floats.iter().any(|f| !f.deferred());
+        // Floats registered for the first line but not yet committed: (page, count before).
+        let mut floats_reg: Option<(usize, usize)> = None;
+        let est0 = pl.lines.first().map(|l| l.height).unwrap_or(12.0);
+        let mut x0: f32;
+        loop {
+            x0 = self.col_x();
+            let fresh = self.at_top() && first_on_page;
+            if li == 0 && floats_pending {
+                let pi = self.pages.len() - 1;
+                let count = self.draws[pi].len();
+                let g = self.ref_geo();
+                let para_top = self.y;
+                for it in pl.floats.iter().filter(|f| !f.deferred()) {
+                    let (fx, fy) = float_pos(it, &g, para_top, (para_top, est0), x0);
+                    self.draws[pi].push(float_draw(it, path, fx, fy));
+                }
+                floats_reg = Some((pi, count));
+                floats_pending = false;
+            }
+            let mut top = self.y;
+            if diverged || (li < pl.lines.len() && self.has_wrap() && self.band_blocked(top, top + pl.lines[li].height, x0, x0 + width)) {
+                diverged = true;
+                pl.lines.truncate(li);
+                let est = if li > 0 { pl.lines[li - 1].height } else { est0 };
+                match self.break_around(&mut pl, top, est, x0, width, fresh) {
+                    None => break,
+                    Some((t, line)) => {
+                        top = t;
+                        pl.lines.push(line);
+                    }
+                }
+            }
+            if li >= pl.lines.len() {
+                break;
+            }
+            let n = pl.lines.len();
             let line_h = pl.lines[li].height;
             // footnotes referenced on this line
             let refs: Vec<u32> = pl.note_refs.iter().filter(|(pi, _)| *pi >= pl.lines[li].a && *pi < pl.lines[li].b).map(|(_, id)| *id).collect();
@@ -1163,20 +1677,28 @@ impl<'a> Pager<'a> {
             if !refs.is_empty() && self.page_notes.is_empty() {
                 extra += 12.0; // separator
             }
-            let fits = self.y + line_h + extra <= self.bottom() + 0.01;
+            let fits = top + line_h + extra <= self.bottom() + 0.01;
             // widow control: don't leave the last line alone at the top of the next page
-            let widow = rp.widow_control && n > 2 && li == n - 2 && !self.at_top() && fits && {
+            let widow = !diverged && rp.widow_control && n > 2 && li == n - 2 && !self.at_top() && fits && {
                 let next_fits = self.y + line_h + pl.lines[n - 1].height <= self.bottom() + 0.01;
                 !next_fits
             } && li >= 2;
-            if (!fits || widow) && !(self.at_top() && first_on_page) {
+            if (!fits || widow) && !fresh {
                 // finish paragraph decoration on this page
                 self.decorate_para(&rp, x0, seg_top, self.y, li == 0, false);
+                if li == 0 {
+                    // The paragraph moves on: its floats go with it.
+                    if let Some((p, c)) = floats_reg.take() {
+                        self.draws[p].truncate(c);
+                        floats_pending = true;
+                    }
+                }
                 self.next_frame();
                 seg_top = self.y;
                 first_on_page = true;
                 continue;
             }
+            floats_reg = None;
             for id in refs {
                 if !self.page_notes.contains(&id) {
                     if self.page_notes.is_empty() {
@@ -1186,7 +1708,7 @@ impl<'a> Pager<'a> {
                     self.page_notes.push(id);
                 }
             }
-            let top = self.y;
+            self.y = top;
             let pi = self.pages.len() - 1;
             let page = self.pages.last_mut().unwrap();
             emit_line(cx, &pl, li, path, x0, top, page, li == 0, &offset_base);
@@ -1194,6 +1716,16 @@ impl<'a> Pager<'a> {
             self.index.entry(path).or_default().push((pi, line_idx));
             if path.story == Story::Body {
                 self.body_lines += 1;
+            }
+            // Objects positioned relative to this line or its characters.
+            if has_deferred {
+                let line = &pl.lines[li];
+                let g = self.ref_geo();
+                for it in pl.floats.iter().filter(|f| f.deferred() && f.piece >= line.a && f.piece < line.b) {
+                    let ax = x0 + line.xs[it.piece - line.a];
+                    let (fx, fy) = float_pos(it, &g, top, (top, line_h), ax);
+                    self.draws[pi].push(float_draw(it, path, fx, fy));
+                }
             }
             self.y += line_h;
             first_on_page = false;
@@ -1215,7 +1747,6 @@ impl<'a> Pager<'a> {
             }
             li += 1;
         }
-        let _ = para_top;
         let joined = self.prev_para.as_ref().map(|p| p.3 == rp.borders && !rp.borders.is_empty()).unwrap_or(false);
         self.decorate_para(&rp, x0, seg_top, self.y, !joined, true);
         if let Some(level) = rp.outline_level {
@@ -1227,6 +1758,7 @@ impl<'a> Pager<'a> {
             }
         }
         self.y += rp.space_after;
+        self.max_y = self.max_y.max(self.y);
         self.prev_para = Some((rp.style.clone(), rp.space_after, rp.contextual_spacing, rp.borders.clone()));
     }
 
@@ -1373,6 +1905,7 @@ impl<'a> Pager<'a> {
             first_row_on_page = false;
             ri += 1;
         }
+        self.max_y = self.max_y.max(self.y);
         self.prev_para = None;
     }
 
@@ -1468,6 +2001,12 @@ impl<'a> Pager<'a> {
                     y += sb;
                     let path = ParaPath { story, block, cell: Some(CellRef { row: ri, col: ci, para: pidx }) };
                     let ptop = y;
+                    if !repeated && !pl.floats.is_empty() {
+                        let g = RefGeo { col_x: x + margin, col_w: (w - 2.0 * margin).max(1.0), ..self.ref_geo() };
+                        let mut v = Vec::new();
+                        static_floats(pl, path, &g, ptop, x + margin, &mut v);
+                        self.draws[pi].append(&mut v);
+                    }
                     for li in 0..pl.lines.len() {
                         let page = self.pages.last_mut().unwrap();
                         emit_line(cx, pl, li, path, x + margin, y, page, li == 0, ob);
@@ -1505,6 +2044,10 @@ fn offset_table(p: &Paragraph) -> Vec<usize> {
     (0..=p.len()).collect()
 }
 
+fn offset_table_len(n: usize) -> Vec<usize> {
+    (0..=n).collect()
+}
+
 /// Lay out a whole document.
 pub fn layout(doc: &Document, db: &FontDb, opts: &LayoutOptions) -> DocLayout {
     // Footnote numbering in reference order.
@@ -1528,9 +2071,8 @@ pub fn layout(doc: &Document, db: &FontDb, opts: &LayoutOptions) -> DocLayout {
         }
     }
     let cx = Ctx { doc, db, opts, note_numbers: &note_numbers, endnote_numbers: &endnote_numbers };
-    let ps = &doc.page;
-    // Header/footer extents (measured on page 1) may push the body area.
-    let hf_height = |blocks: &Vec<Block>| -> f32 {
+    // Header/footer extents (measured with page 1 fields) may push the body area.
+    let hf_height = |blocks: &Vec<Block>, ps: &PageSetup| -> f32 {
         let mut c = ListCounter::default();
         let mut h = 0.0;
         for b in blocks {
@@ -1541,20 +2083,49 @@ pub fn layout(doc: &Document, db: &FontDb, opts: &LayoutOptions) -> DocLayout {
         }
         h
     };
-    let header_h = hf_height(&doc.headers.header).max(hf_height(&doc.headers.first_header));
-    let footer_h = hf_height(&doc.headers.footer).max(hf_height(&doc.headers.first_footer));
-    let body_top = ps.margin_top.max(ps.header_distance + header_h + 4.0 * (header_h > 0.0) as i32 as f32);
-    let body_bottom = (ps.height - ps.margin_bottom).min(ps.height - ps.footer_distance - footer_h - 4.0 * (footer_h > 0.0) as i32 as f32);
-    let body_bottom = body_bottom.max(body_top + 72.0);
+    let nsec = doc.section_count();
+    let secs = doc.sections();
+    let mut geos = Vec::with_capacity(nsec);
+    let mut hf_sets: Vec<&HeadersFooters> = Vec::with_capacity(nsec);
+    for i in 0..nsec {
+        let ps = secs.get(i).map(|s| &s.page).unwrap_or(&doc.page);
+        let owner = if i + 1 >= nsec { None } else { (0..=i).rev().find(|&j| secs[j].headers.is_some()) };
+        let hf = match owner {
+            Some(j) => secs[j].headers.as_ref().unwrap(),
+            None => &doc.headers,
+        };
+        let story = |kind: HfKind| match owner {
+            Some(j) => Story::SectionPart(j as u16, kind),
+            None => match kind {
+                HfKind::Header => Story::Header,
+                HfKind::Footer => Story::Footer,
+                HfKind::FirstHeader => Story::FirstHeader,
+                HfKind::FirstFooter => Story::FirstFooter,
+            },
+        };
+        let header_h = hf_height(&hf.header, ps).max(if ps.title_page { hf_height(&hf.first_header, ps) } else { 0.0 });
+        let footer_h = hf_height(&hf.footer, ps).max(if ps.title_page { hf_height(&hf.first_footer, ps) } else { 0.0 });
+        let body_top = ps.margin_top.max(ps.header_distance + header_h + 4.0 * (header_h > 0.0) as i32 as f32);
+        let body_bottom = (ps.height - ps.margin_bottom).min(ps.height - ps.footer_distance - footer_h - 4.0 * (footer_h > 0.0) as i32 as f32);
+        let body_bottom = body_bottom.max(body_top + 72.0);
+        geos.push(SecGeo {
+            ps: ps.clone(),
+            body_top,
+            body_bottom,
+            stories: [story(HfKind::Header), story(HfKind::Footer), story(HfKind::FirstHeader), story(HfKind::FirstFooter)],
+        });
+        hf_sets.push(hf);
+    }
+    drop(secs);
 
     let mut pager = Pager {
         cx: &cx,
         pages: Vec::new(),
         index: HashMap::new(),
         col: 0,
-        y: body_top,
-        body_top,
-        body_bottom,
+        y: 0.0,
+        body_top: 0.0,
+        body_bottom: 0.0,
         page_notes: Vec::new(),
         notes_height: 0.0,
         counter: ListCounter::default(),
@@ -1562,17 +2133,36 @@ pub fn layout(doc: &Document, db: &FontDb, opts: &LayoutOptions) -> DocLayout {
         prev_para: None,
         body_lines: 0,
         note_cache: HashMap::new(),
+        geos,
+        sec: 0,
+        page_first: Vec::new(),
+        region_top: 0.0,
+        max_y: 0.0,
+        col_left: 0.0,
+        col_w: 0.0,
+        col_gap: 0.0,
+        ncols: 1,
+        draws: Vec::new(),
     };
-    pager.new_page();
+    pager.new_page_ex(true);
     // Track footnotes per page to draw at page end.
     let mut notes_by_page: Vec<Vec<u32>> = vec![Vec::new()];
     let blocks = &doc.body;
+    let mut cur_sec = 0usize;
     for (bi, b) in blocks.iter().enumerate() {
+        if cur_sec != pager.sec {
+            pager.start_section(cur_sec);
+        }
         let before_pages = pager.pages.len();
         let notes_before = pager.page_notes.clone();
         match b {
             Block::Para(p) => pager.place_paragraph(p, ParaPath::body(bi), blocks.get(bi + 1)),
             Block::Table(t) => pager.place_table(t, bi, Story::Body),
+        }
+        if let Block::Para(p) = b {
+            if p.section.is_some() && cur_sec + 1 < nsec {
+                cur_sec += 1;
+            }
         }
         // record notes for pages
         while notes_by_page.len() < pager.pages.len() {
@@ -1628,30 +2218,40 @@ pub fn layout(doc: &Document, db: &FontDb, opts: &LayoutOptions) -> DocLayout {
     let mut pages = std::mem::take(&mut pager.pages);
     let index = std::mem::take(&mut pager.index);
     let headings = std::mem::take(&mut pager.headings);
+    let mut draws = std::mem::take(&mut pager.draws);
+    let page_first = std::mem::take(&mut pager.page_first);
+    let geos = std::mem::take(&mut pager.geos);
     drop(pager);
     while notes_by_page.len() < pages.len() {
         notes_by_page.push(Vec::new());
     }
 
-    // Headers, footers, footnotes, page decorations.
+    // Headers, footers, footnotes, page decorations, floating objects.
     for (pi, page) in pages.iter_mut().enumerate() {
+        let g = &geos[page.section];
+        let ps = &g.ps;
+        let hf = hf_sets[page.section];
         let fc = FieldCtx { page_number: page.number, page_count: total_pages as u32 };
-        let first = pi == 0 && ps.title_page;
-        let (hdr, hstory) = if first { (&doc.headers.first_header, Story::FirstHeader) } else { (&doc.headers.header, Story::Header) };
-        let (ftr, fstory) = if first { (&doc.headers.first_footer, Story::FirstFooter) } else { (&doc.headers.footer, Story::Footer) };
-        let mut extra = Vec::new();
+        let first = page_first.get(pi).copied().unwrap_or(false) && ps.title_page;
+        let (hk, fk, hs, fs) = if first { (HfKind::FirstHeader, HfKind::FirstFooter, g.stories[2], g.stories[3]) } else { (HfKind::Header, HfKind::Footer, g.stories[0], g.stories[1]) };
+        let (hdr, hstory) = (hf.part(hk), hs);
+        let (ftr, fstory) = (hf.part(fk), fs);
+        page.header_story = Some(hstory);
+        page.footer_story = Some(fstory);
+        let hg = RefGeo::of(ps, ps.margin_left, ps.text_width());
+        let page_draws = &mut draws[pi];
         // header
         let mut y = ps.header_distance;
         let mut counter = ListCounter::default();
-        let mut hf_index: Vec<(ParaPath, usize)> = Vec::new();
         for (bi, b) in hdr.iter().enumerate() {
             if let Block::Para(p) = b {
                 let pl = layout_paragraph(&cx, p, ps.text_width(), fc, &mut counter);
                 y += pl.rp.space_before;
                 let ob = offset_table(p);
+                let path = ParaPath { story: hstory, block: bi, cell: None };
+                static_floats(&pl, path, &hg, y, ps.margin_left, page_draws);
                 for li in 0..pl.lines.len() {
-                    emit_line(&cx, &pl, li, ParaPath { story: hstory, block: bi, cell: None }, ps.margin_left, y, page, li == 0, &ob);
-                    hf_index.push((ParaPath { story: hstory, block: bi, cell: None }, page.lines.len() - 1));
+                    emit_line(&cx, &pl, li, path, ps.margin_left, y, page, li == 0, &ob);
                     y += pl.lines[li].height;
                 }
                 y += pl.rp.space_after;
@@ -1672,15 +2272,13 @@ pub fn layout(doc: &Document, db: &FontDb, opts: &LayoutOptions) -> DocLayout {
         for (bi, p, pl) in &fls {
             y += pl.rp.space_before;
             let ob = offset_table(p);
+            let path = ParaPath { story: fstory, block: *bi, cell: None };
+            static_floats(pl, path, &hg, y, ps.margin_left, page_draws);
             for li in 0..pl.lines.len() {
-                emit_line(&cx, pl, li, ParaPath { story: fstory, block: *bi, cell: None }, ps.margin_left, y, page, li == 0, &ob);
-                hf_index.push((ParaPath { story: fstory, block: *bi, cell: None }, page.lines.len() - 1));
+                emit_line(&cx, pl, li, path, ps.margin_left, y, page, li == 0, &ob);
                 y += pl.lines[li].height;
             }
             y += pl.rp.space_after;
-        }
-        for (path, li) in hf_index {
-            extra.push((path, li));
         }
         // footnotes
         let notes = &notes_by_page[pi];
@@ -1748,11 +2346,22 @@ pub fn layout(doc: &Document, db: &FontDb, opts: &LayoutOptions) -> DocLayout {
                 border_line_vec(&mut back, x, r, t, r, bt);
             }
         }
+        // Floating objects: behind the text, or in front of it.
+        let mut front = Vec::new();
+        for d in page_draws.iter() {
+            let out = if d.fb.wrap == WrapMode::Behind { &mut back } else { &mut front };
+            let fb = &d.fb;
+            match &d.content {
+                FloatContent::Image(img) => out.push(Shape::Image { x: fb.x, y: fb.y, w: fb.w, h: fb.h, image: img.clone() }),
+                FloatContent::TextBox(tb) => textbox_shapes(&cx, tb, fb.x, fb.y, fb.w, fb.h, fc, out),
+            }
+        }
         if !back.is_empty() {
             back.append(&mut page.shapes);
             page.shapes = back;
         }
-        let _ = extra;
+        page.shapes.append(&mut front);
+        page.floats = page_draws.iter().map(|d| d.fb.clone()).collect();
     }
     // Index header/footer lines too (only the ones on each page, keyed per path: first occurrence wins).
     let mut index = index;
@@ -1767,7 +2376,7 @@ pub fn layout(doc: &Document, db: &FontDb, opts: &LayoutOptions) -> DocLayout {
 }
 
 fn border_line_vec(v: &mut Vec<Shape>, b: &Border, x1: f32, y1: f32, x2: f32, y2: f32) {
-    let mut p = Page { index: 0, number: 0, width: 0.0, height: 0.0, shapes: Vec::new(), lines: Vec::new(), body_top: 0.0, body_bottom: 0.0, comment_marks: Vec::new() };
+    let mut p = Page::default();
     border_line(&mut p, b, x1, y1, x2, y2);
     v.append(&mut p.shapes);
 }
