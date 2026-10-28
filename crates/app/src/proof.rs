@@ -145,6 +145,31 @@ fn replace_range(app: &mut App, pos: Pos, start: usize, end: usize, with: &str) 
     app.changed();
 }
 
+/// Replace every flagged occurrence of `word` in the body with `with`, as one undo step.
+pub fn change_all(app: &mut App, word: &str, with: &str) -> usize {
+    app.checkpoint("Change All", EditKind::Other);
+    let mut n = 0;
+    for path in app.doc.para_paths(Story::Body) {
+        let Some(p) = app.doc.para(&path) else { continue };
+        let text = p.plain_text();
+        let mut hits: Vec<(usize, usize)> = issues_for(&text)
+            .into_iter()
+            .filter(|i| i.kind == IssueKind::Spelling && word_text(&app.doc, path.at(0), i) == word)
+            .map(|i| (i.start, i.end))
+            .collect();
+        hits.reverse();
+        for (start, end) in hits {
+            let props = app.doc.para(&path).map(|p| p.props_at(start + 1)).unwrap_or_default();
+            let at = app.doc.delete_range(path.at(start), path.at(end));
+            let np = app.doc.insert_text(at, with, &props);
+            app.sel = crate::app::Selection::caret(np);
+            n += 1;
+        }
+    }
+    app.changed();
+    n
+}
+
 fn word_text(doc: &Document, pos: Pos, is: &Issue) -> String {
     doc.text_range(Pos { offset: is.start, ..pos }, Pos { offset: is.end, ..pos })
 }
@@ -272,15 +297,51 @@ pub fn spelling_panel(app: &mut App, ui: &mut Ui) {
         None if is.kind == IssueKind::Spelling => Speller::english().suggest(&word, 8),
         None => Vec::new(),
     };
+    // The chosen suggestion, kept per issue so it resets when the issue changes.
+    let key = ui.id().with(("spell_pick", a.path.clone(), is.start, word.clone()));
+    let mut pick: usize = ui.ctx().data(|d| d.get_temp(key)).unwrap_or(0);
+    if pick >= sugg.len() {
+        pick = 0;
+    }
     ui.label("Suggestions:");
     if sugg.is_empty() {
-        ui.label(RichText::new("(none)").weak());
+        ui.label(RichText::new("(no suggestions)").weak());
     }
-    for s in &sugg {
-        let label = if s.is_empty() { "(delete)".to_string() } else { s.clone() };
-        if ui.add_sized([ui.available_width(), 24.0], egui::Button::new(label)).clicked() {
+    let mut change_now = None;
+    egui::Frame::new().stroke(ui.visuals().widgets.noninteractive.bg_stroke).inner_margin(4.0).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        for (i, s) in sugg.iter().enumerate() {
+            let label = if s.is_empty() { "(delete)".to_string() } else { s.clone() };
+            let r = ui.add_sized([ui.available_width(), 22.0], egui::Button::selectable(i == pick, label));
+            if r.clicked() {
+                pick = i;
+            }
+            if r.double_clicked() {
+                change_now = Some(i);
+            }
+        }
+    });
+    ui.ctx().data_mut(|d| d.insert_temp(key, pick));
+    ui.add_space(8.0);
+    let chosen = sugg.get(pick).cloned();
+    ui.horizontal_wrapped(|ui| {
+        let can = chosen.is_some();
+        if ui.add_enabled(can, egui::Button::new("Change")).clicked() {
+            change_now = Some(pick);
+        }
+        if ui.add_enabled(can && is.kind == IssueKind::Spelling, egui::Button::new("Change All")).clicked() {
+            if let Some(c) = &chosen {
+                change_all(app, &word, c);
+                spelling_next(app);
+                return;
+            }
+        }
+    });
+    if let Some(i) = change_now {
+        if let Some(s) = sugg.get(i) {
             replace_range(app, a, is.start, is.end, s);
             spelling_next(app);
+            return;
         }
     }
     ui.add_space(10.0);

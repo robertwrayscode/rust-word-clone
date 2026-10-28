@@ -147,6 +147,11 @@ fn run_action(app: &mut App, a: &str) {
                 _ => Some(SidePanel::Thesaurus { word: arg.trim_start_matches("thesaurus=").to_string() }),
             }
         }
+        "changeall" => {
+            if let Some((w, r)) = arg.split_once('=') {
+                crate::proof::change_all(app, w, r);
+            }
+        }
         "zoom" => {
             if let Ok(z) = arg.parse::<f32>() {
                 app.zoom = z / 100.0;

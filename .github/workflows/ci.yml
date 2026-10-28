@@ -73,6 +73,7 @@ jobs:
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
           cp target/${{ matrix.target }}/release/rword "$APP/Contents/MacOS/rword"
           cp packaging/macos/Info.plist "$APP/Contents/Info.plist"
+          cp crates/app/assets/icon/rword.icns "$APP/Contents/Resources/rword.icns"
           codesign --force --deep --sign - "$APP"
           ditto -c -k --keepParent "$APP" ${{ matrix.artifact }}.zip
       - name: Package (Windows)

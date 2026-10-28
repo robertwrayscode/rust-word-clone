@@ -62,7 +62,12 @@ fn main() -> eframe::Result {
             .with_title("Document1 - RWord")
             .with_inner_size([1360.0, 880.0])
             .with_min_inner_size([700.0, 420.0])
-            .with_drag_and_drop(true),
+            .with_drag_and_drop(true)
+            .with_icon(std::sync::Arc::new(egui::IconData {
+                rgba: include_bytes!("../assets/icon/rword-128.rgba").to_vec(),
+                width: 128,
+                height: 128,
+            })),
         ..Default::default()
     };
     eframe::run_native(
