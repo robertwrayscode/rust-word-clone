@@ -257,7 +257,7 @@ impl App {
 
     pub fn title(&self) -> String {
         let name = self.path.as_ref().and_then(|p| p.file_name()).map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "Document1".into());
-        format!("{}{} - RWord", name, if self.modified { " •" } else { "" })
+        format!("{}{} - RWord {}", name, if self.modified { " •" } else { "" }, env!("CARGO_PKG_VERSION"))
     }
 
     // -------------------------------------------------------------------
@@ -1845,8 +1845,26 @@ impl App {
         }
     }
 
-    /// Print: export a PDF to a temporary file and open it in the system viewer, which prints it.
+    /// Print: show the Print dialog.
     pub fn print(&mut self) {
+        self.ensure_layout();
+        let (printers, default) = crate::print::printers();
+        let printer = default.or_else(|| printers.first().cloned()).unwrap_or_default();
+        self.dialog = Some(Dialog::Print { printers, printer, copies: 1, which: 0, range: String::new() });
+    }
+
+    /// Send pages (0-based) to `printer`.
+    pub fn print_pages(&mut self, ctx: &egui::Context, printer: String, copies: u32, pages: Vec<usize>) {
+        self.ensure_layout();
+        let pdf = wordcore::pdf::export_pages(&self.layout, self.db, &self.doc.properties, &pages);
+        let list: Vec<_> = pages.iter().filter_map(|&i| self.layout.pages.get(i).cloned()).collect();
+        let title = self.path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "Document1".into());
+        self.status = format!("Sending {} to {}...", if list.len() == 1 { "1 page".to_string() } else { format!("{} pages", list.len()) }, printer);
+        crate::print::start(crate::print::Job { printer, copies, title, pages: list, pdf }, ctx.clone());
+    }
+
+    /// Fallback: open the document as a PDF in the system viewer.
+    pub fn print_via_viewer(&mut self) {
         self.ensure_layout();
         let bytes = wordcore::pdf::export(&self.layout, self.db, &self.doc.properties);
         let name = self.path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "Document1".into());
@@ -1854,7 +1872,7 @@ impl App {
         match std::fs::write(&tmp, bytes) {
             Ok(()) => {
                 crate::fileio::print_pdf(&tmp);
-                self.status = "Sent to your PDF viewer for printing.".into();
+                self.status = "Opened as a PDF in your viewer.".into();
             }
             Err(e) => self.dialog = Some(Dialog::Message { title: "Print".into(), text: format!("Couldn't prepare the document for printing: {}", e) }),
         }

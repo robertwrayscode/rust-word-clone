@@ -73,6 +73,8 @@ pub enum Dialog {
     Options { author: String, autocorrect: bool, spelling: bool },
     Properties(Box<DocProperties>),
     About,
+    /// which: 0 all pages, 1 current page, 2 custom range.
+    Print { printers: Vec<String>, printer: String, copies: u32, which: u8, range: String },
     Zoom { pct: f32 },
     Shortcuts,
     TextBox { pos: wordcore::Pos, text: String, fill: Option<wordcore::Color>, border: bool, width: f32, height: f32 },
@@ -980,6 +982,87 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                     keep = false;
                 }
             });
+        }
+        Dialog::Print { printers, printer, copies, which, range } => {
+            let pages = app.layout.pages.len().max(1);
+            let current = app.layout.page_of(app.sel.head).unwrap_or(0);
+            let mut go = None;
+            let mut viewer = false;
+            window("Print").show(ctx, |ui| {
+                ui.set_min_width(340.0);
+                if printers.is_empty() {
+                    ui.label(RichText::new("No printers are set up on this computer.").strong());
+                    ui.label(if cfg!(target_os = "macos") {
+                        "Add one in System Settings > Printers & Scanners, then try again."
+                    } else if cfg!(windows) {
+                        "Add one in Settings > Bluetooth & devices > Printers & scanners, then try again."
+                    } else {
+                        "Add a printer in your system settings, then try again."
+                    });
+                } else {
+                    Grid::new("print").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+                        ui.label("Printer:");
+                        ComboBox::from_id_salt("printer").width(230.0).selected_text(printer.as_str()).show_ui(ui, |ui| {
+                            for p in printers.iter() {
+                                ui.selectable_value(printer, p.clone(), p);
+                            }
+                        });
+                        ui.end_row();
+                        ui.label("Copies:");
+                        ui.add(DragValue::new(copies).range(1..=99));
+                        ui.end_row();
+                        ui.label("Pages:");
+                        ui.vertical(|ui| {
+                            ui.radio_value(which, 0, format!("Print All Pages ({})", pages));
+                            ui.radio_value(which, 1, format!("Print Current Page ({})", current + 1));
+                            ui.horizontal(|ui| {
+                                ui.radio_value(which, 2, "Custom:");
+                                let r = ui.add(TextEdit::singleline(range).desired_width(110.0).hint_text("e.g. 1-3, 5"));
+                                if r.changed() {
+                                    *which = 2;
+                                }
+                            });
+                        });
+                        ui.end_row();
+                    });
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.link("Open as PDF instead").on_hover_text("Open the document in your PDF viewer and print from there").clicked() {
+                        viewer = true;
+                    }
+                });
+                let w = ui.available_width().max(200.0);
+                ui.allocate_ui_with_layout(egui::vec2(w, 26.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        keep = false;
+                    }
+                    let enabled = !printers.is_empty() && !printer.is_empty();
+                    if ui.add_enabled(enabled, egui::Button::new(RichText::new("  Print  ").strong())).clicked() {
+                        let list = match *which {
+                            0 => Some((0..pages).collect::<Vec<_>>()),
+                            1 => Some(vec![current]),
+                            _ => crate::print::parse_range(range, pages),
+                        };
+                        go = Some(list);
+                    }
+                });
+            });
+            match go {
+                Some(Some(list)) => {
+                    let (p, c) = (printer.clone(), *copies);
+                    app.print_pages(ctx, p, c, list);
+                    keep = false;
+                }
+                Some(None) => {
+                    app.status = format!("Enter pages between 1 and {}, like 1-3, 5.", pages);
+                }
+                None => {}
+            }
+            if viewer {
+                app.print_via_viewer();
+                keep = false;
+            }
         }
         Dialog::About => {
             window("About RWord").show(ctx, |ui| {

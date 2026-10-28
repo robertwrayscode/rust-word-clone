@@ -125,7 +125,7 @@ fn file_menu(app: &mut App, ui: &mut Ui) {
             ui.close();
         }
         ui.separator();
-        if ui.add(egui::Button::new("Print...").shortcut_text(sc("P"))).on_hover_text("Opens the document as a PDF in your system viewer, ready to print").clicked() {
+        if ui.add(egui::Button::new("Print...").shortcut_text(sc("P"))).on_hover_text("Choose a printer and print the document").clicked() {
             app.print();
             ui.close();
         }

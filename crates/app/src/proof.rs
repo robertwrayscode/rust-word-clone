@@ -298,7 +298,7 @@ pub fn spelling_panel(app: &mut App, ui: &mut Ui) {
         None => Vec::new(),
     };
     // The chosen suggestion, kept per issue so it resets when the issue changes.
-    let key = ui.id().with(("spell_pick", a.path.clone(), is.start, word.clone()));
+    let key = ui.scope_id().with(("spell_pick", a.path.clone(), is.start, word.clone()));
     let mut pick: usize = ui.ctx().data(|d| d.get_temp(key)).unwrap_or(0);
     if pick >= sugg.len() {
         pick = 0;

@@ -13,6 +13,7 @@ mod macos_open;
 mod objects;
 mod panels;
 mod png;
+mod print;
 mod proof;
 mod ribbon;
 mod theme;
@@ -59,7 +60,7 @@ fn main() -> eframe::Result {
     macos_open::install();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Document1 - RWord")
+            .with_title(format!("Document1 - RWord {}", env!("CARGO_PKG_VERSION")))
             .with_inner_size([1360.0, 880.0])
             .with_min_inner_size([700.0, 420.0])
             .with_drag_and_drop(true)

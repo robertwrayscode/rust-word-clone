@@ -41,6 +41,17 @@ impl eframe::App for App {
             self.request(Pending::Open(Some(p)));
         }
 
+        // Finished print jobs.
+        if let Some((printer, r)) = crate::print::take_result() {
+            match r {
+                Ok(()) => self.status = format!("Sent to {}.", printer),
+                Err(e) => {
+                    self.status = "Printing failed.".into();
+                    self.dialog = Some(Dialog::Message { title: "Print".into(), text: e });
+                }
+            }
+        }
+
         // Window close.
         if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close {
             if self.modified {
@@ -173,6 +184,10 @@ fn run_action(app: &mut App, a: &str) {
             app.dialog = match arg {
                 "wordcount" => Some(Dialog::WordCount),
                 "about" => Some(Dialog::About),
+                "print" => {
+                    app.print();
+                    app.dialog.take()
+                }
                 "shortcuts" => Some(Dialog::Shortcuts),
                 "font" => Some(Dialog::font(app)),
                 "paragraph" => Some(Dialog::paragraph(app)),
@@ -186,6 +201,23 @@ fn run_action(app: &mut App, a: &str) {
         }
         "save" => {
             app.save_to(PathBuf::from(arg));
+        }
+        "printpng" => {
+            // Testing aid: draw page 1 the way it is sent to a Windows printer.
+            app.ensure_layout();
+            if let Some(pm) = app.layout.pages.first().and_then(|p| crate::print::render_page(p, app.db, 150.0)) {
+                let _ = pm.save_png(arg);
+            }
+        }
+        "printjob" => {
+            // Testing aid: print every page to the default printer and wait.
+            app.ensure_layout();
+            let (list, def) = crate::print::printers();
+            let printer = def.or_else(|| list.first().cloned()).unwrap_or_default();
+            let n = app.layout.pages.len();
+            let pdf = wordcore::pdf::export_pages(&app.layout, app.db, &app.doc.properties, &(0..n).collect::<Vec<_>>());
+            let job = crate::print::Job { printer: printer.clone(), copies: 1, title: "Test".into(), pages: app.layout.pages.clone(), pdf };
+            eprintln!("printjob to {:?}: {:?}", printer, crate::print::run(job));
         }
         "pdf" => {
             app.export_pdf_to(PathBuf::from(arg));
