@@ -49,11 +49,11 @@ pub fn show(app: &mut App, ui: &mut Ui) {
         ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add_space(8.0);
             let tip = app.redo_label().map(|l| format!("Redo {} ({})", l, sc("Y"))).unwrap_or_else(|| "Can't Redo".into());
-            if ui.add_enabled(app.can_redo(), egui::Button::new("↷").frame_when_inactive(false)).on_hover_text(tip).clicked() {
+            if ui.add_enabled(app.can_redo(), egui::Button::new(RichText::new("↷").size(18.0).color(theme::ACCENT_DARK)).frame_when_inactive(false)).on_hover_text(tip).clicked() {
                 app.redo();
             }
             let tip = app.undo_label().map(|l| format!("Undo {} ({})", l, sc("Z"))).unwrap_or_else(|| "Can't Undo".into());
-            if ui.add_enabled(app.can_undo(), egui::Button::new("↶").frame_when_inactive(false)).on_hover_text(tip).clicked() {
+            if ui.add_enabled(app.can_undo(), egui::Button::new(RichText::new("↶").size(18.0).color(theme::ACCENT_DARK)).frame_when_inactive(false)).on_hover_text(tip).clicked() {
                 app.undo();
             }
             if ui.add(egui::Button::new("💾").frame_when_inactive(false)).on_hover_text(format!("Save ({})", sc("S"))).clicked() {
@@ -365,6 +365,16 @@ const SIZES: [f32; 21] = [8.0, 9.0, 10.0, 10.5, 11.0, 12.0, 14.0, 16.0, 18.0, 20
 fn home(app: &mut App, ui: &mut Ui) {
     let st = app.current_resolved();
     let pp = app.current_para();
+    group(ui, "Undo", |ui| {
+        let tip = app.undo_label().map(|l| format!("Undo {} ({})", l, sc("Z"))).unwrap_or_else(|| "Nothing to undo".into());
+        if big(ui, "↶", "Undo", &tip).clicked() && app.can_undo() {
+            app.undo();
+        }
+        let tip = app.redo_label().map(|l| format!("Redo {} ({})", l, sc("Y"))).unwrap_or_else(|| "Nothing to redo".into());
+        if big(ui, "↷", "Redo", &tip).clicked() && app.can_redo() {
+            app.redo();
+        }
+    });
     group(ui, "Clipboard", |ui| {
         let r = big(ui, "📋", "Paste", &format!("Paste ({})", sc("V")));
         if r.clicked() {
